@@ -1,0 +1,6 @@
+{
+  "name": "TelePoll Agent",
+  "description": "Personal AI agent that turns text, images, and PDFs into Telegram polls with automated channel scheduling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

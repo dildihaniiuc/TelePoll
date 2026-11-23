@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Manrope", "Hind Siliguri", "Noto Sans Bengali", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    background-color: #04070b;
+    color: #e6edf3;
+  }
+
+  select,
+  option {
+    background-color: #070d14;
+    color: #e6edf3;
+  }
+}
+
+.terminal-grid-bg {
+  background-color: #04070b;
+  background-image:
+    linear-gradient(to right, rgba(16, 185, 129, 0.055) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(16, 185, 129, 0.055) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* Subtle CRT phosphor scanlines */
+.crt-scanlines {
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 255, 102, 0.028) 0px,
+    rgba(0, 255, 102, 0.028) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+
+/* Cyber terminal HUD panel with subtle corner brackets and phosphor edge glow */
+.hacker-panel {
+  background-color: rgba(7, 13, 19, 0.88);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(16, 185, 129, 0.28);
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.62),
+    0 0 18px rgba(16, 185, 129, 0.07),
+    inset 0 1px 0 rgba(0, 255, 136, 0.12);
+  background-image:
+    linear-gradient(to right, #10b981 2px, transparent 2px),
+    linear-gradient(to bottom, #10b981 2px, transparent 2px),
+    linear-gradient(to left, #10b981 2px, transparent 2px),
+    linear-gradient(to bottom, #10b981 2px, transparent 2px),
+    linear-gradient(to right, #10b981 2px, transparent 2px),
+    linear-gradient(to top, #10b981 2px, transparent 2px),
+    linear-gradient(to left, #10b981 2px, transparent 2px),
+    linear-gradient(to top, #10b981 2px, transparent 2px);
+  background-repeat: no-repeat;
+  background-size:
+    9px 1px, 1px 9px,
+    9px 1px, 1px 9px,
+    9px 1px, 1px 9px,
+    9px 1px, 1px 9px;
+  background-position:
+    top left, top left,
+    top right, top right,
+    bottom left, bottom left,
+    bottom right, bottom right;
+}
+
+.hacker-glow-text {
+  text-shadow: 0 0 12px rgba(16, 185, 129, 0.45);
+}
+
+@keyframes cursor-blink {
+  0%, 49% {
+    opacity: 1;
+  }
+  50%, 100% {
+    opacity: 0;
+  }
+}
+
+.terminal-cursor {
+  display: inline-block;
+  animation: cursor-blink 1.05s steps(2, start) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-cursor {
+    animation: none;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Dark terminal scrollbar */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: #04070b;
+}
+::-webkit-scrollbar-thumb {
+  background: #133128;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #10b981aa;
+}
