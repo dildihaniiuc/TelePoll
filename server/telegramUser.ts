@@ -15,18 +15,92 @@ import { readStore } from "./store.ts";
 import { processTelegramAgentMessage } from "./telegramAgentBrain.ts";
 import type { PollDraft, SourceKind, TelegramDialogSummary } from "./types.ts";
 
-interface PendingAuth {
-  client: TelegramClient;
+const IS_VERCEL = Boolean(process.env.VERCEL || process.env.NOW_REGION);
+
+interface PendingAuthPayload {
   apiId: number;
   apiHash: string;
   phoneNumber: string;
   phoneCodeHash: string;
+  sessionString: string;
   createdAt: number;
 }
 
-const pendingAuths = new Map<string, PendingAuth>();
+const pendingAuths = new Map<string, PendingAuthPayload>();
 const activeClients = new Map<string, TelegramClient>();
 const connectingPromises = new Map<string, Promise<TelegramClient>>();
+
+function getStatelessAuthKey(): Buffer {
+  const seed =
+    process.env.AUTH_SECRET ||
+    process.env.GEMINI_API_KEY ||
+    process.env.TELEGRAM_API_HASH ||
+    "telepoll-stateless-auth-secret-v1";
+  return crypto.createHash("sha256").update(seed).digest();
+}
+
+function encryptPendingAuthToken(payload: PendingAuthPayload): string {
+  const key = getStatelessAuthKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const plaintext = Buffer.from(JSON.stringify(payload), "utf8");
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [
+    "v1",
+    iv.toString("base64url"),
+    tag.toString("base64url"),
+    encrypted.toString("base64url"),
+  ].join(".");
+}
+
+function decryptPendingAuthToken(token: string): PendingAuthPayload | null {
+  if (!token || !token.startsWith("v1.")) return null;
+  const parts = token.split(".");
+  if (parts.length !== 4) return null;
+  try {
+    const iv = Buffer.from(parts[1], "base64url");
+    const tag = Buffer.from(parts[2], "base64url");
+    const encrypted = Buffer.from(parts[3], "base64url");
+    const key = getStatelessAuthKey();
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([
+      decipher.update(encrypted),
+      decipher.final(),
+    ]);
+    const parsed = JSON.parse(decrypted.toString("utf8")) as PendingAuthPayload;
+    if (
+      !parsed ||
+      !parsed.apiId ||
+      !parsed.apiHash ||
+      !parsed.phoneNumber ||
+      !parsed.phoneCodeHash ||
+      typeof parsed.sessionString !== "string"
+    ) {
+      return null;
+    }
+    if (Date.now() - parsed.createdAt > 15 * 60_000) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function normalizePhoneNumber(raw: string): string {
+  let cleaned = raw.trim().replace(/[\s()-]+/g, "");
+  if (cleaned.startsWith("00")) {
+    cleaned = `+${cleaned.slice(2)}`;
+  } else if (/^01\d{9}$/.test(cleaned)) {
+    // Auto-normalize Bangladesh 11-digit local numbers like 017XXXXXXXX
+    cleaned = `+88${cleaned}`;
+  } else if (/^\d{10,15}$/.test(cleaned)) {
+    cleaned = `+${cleaned}`;
+  }
+  return cleaned;
+}
 
 // Track messages sent by our agent to guarantee zero infinite loops
 const sentByAgentMsgIds = new Set<number>();
@@ -79,10 +153,9 @@ function createQuietLogger(): Logger {
 }
 
 const cleanupInterval = setInterval(() => {
-  const cutoff = Date.now() - 10 * 60_000;
+  const cutoff = Date.now() - 15 * 60_000;
   for (const [id, entry] of pendingAuths.entries()) {
     if (entry.createdAt < cutoff) {
-      void entry.client.disconnect().catch(() => {});
       pendingAuths.delete(id);
     }
   }
@@ -97,25 +170,39 @@ cleanupInterval.unref();
 function formatMtprotoError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   if (msg.includes("PHONE_NUMBER_INVALID")) {
-    return "Invalid phone number format. Include country code (e.g. +8801XXXXXXXXX).";
+    return "ফোন নম্বরটি সঠিক নয়। দেশের কোডসহ লিখুন (যেমন +8801XXXXXXXXX)।";
   }
-  if (msg.includes("PHONE_CODE_INVALID")) {
-    return "Invalid verification code. Please check the code sent to your Telegram app.";
+  if (msg.includes("PHONE_NUMBER_BANNED")) {
+    return "এই টেলিগ্রাম নম্বরটি টেলিগ্রাম থেকে সীমাবদ্ধ বা ব্যান করা হয়েছে।";
+  }
+  if (msg.includes("PHONE_NUMBER_FLOOD")) {
+    return "অনেকবার কোড চাওয়ার কারণে টেলিগ্রাম সাময়িকভাবে ব্লক করেছে। কিছুক্ষণ পর আবার চেষ্টা করুন।";
+  }
+  if (msg.includes("PHONE_CODE_INVALID") || msg.includes("PHONE_CODE_EMPTY")) {
+    return "ভেরিফিকেশন কোডটি সঠিক নয়। টেলিগ্রাম অ্যাপে আসা কোডটি যাচাই করুন।";
   }
   if (msg.includes("PHONE_CODE_EXPIRED")) {
-    return "Verification code expired. Please request a new code.";
+    return "ভেরিফিকেশন কোডের মেয়াদ শেষ হয়েছে। অনুগ্রহ করে নতুন কোড পাঠান।";
   }
-  if (msg.includes("API_ID_INVALID")) {
-    return "Invalid API ID or API Hash from my.telegram.org.";
+  if (msg.includes("API_ID_INVALID") || msg.includes("API_ID_PUBLISHED_FLOOD")) {
+    return "my.telegram.org থেকে নেওয়া API ID বা API Hash সঠিক নয়।";
   }
   if (msg.includes("PASSWORD_HASH_INVALID")) {
-    return "Incorrect 2FA cloud password. Please try again.";
+    return "2FA ক্লাউড পাসওয়ার্ড সঠিক নয়। আবার চেষ্টা করুন।";
   }
   if (msg.includes("CHAT_ADMIN_REQUIRED") || msg.includes("CHAT_WRITE_FORBIDDEN")) {
-    return "You do not have permission to post in this channel/group.";
+    return "এই চ্যানেল/গ্রুপে পোস্ট করার এডমিন অনুমতি আপনার নেই।";
   }
   if (msg.includes("FLOOD_WAIT")) {
-    return "Telegram rate limit hit temporarily. Please wait a few seconds and retry.";
+    return "টেলিগ্রামের রেট-লিমিট হিট হয়েছে। কয়েক সেকেন্ড পর আবার চেষ্টা করুন।";
+  }
+  if (
+    msg.includes("ETIMEDOUT") ||
+    msg.includes("ECONNREFUSED") ||
+    msg.includes("CONNECT_TIMEOUT") ||
+    msg.includes("Not connected")
+  ) {
+    return "টেলিগ্রাম সার্ভারের সাথে সংযোগ হতে সময় বেশি লাগছে। কয়েক সেকেন্ড পর আবার চেষ্টা করুন।";
   }
   return msg;
 }
@@ -154,10 +241,12 @@ async function getConnectedClient(
       apiId,
       apiHash,
       {
-        connectionRetries: 25,
-        retryDelay: 2000,
-        autoReconnect: true,
-        requestRetries: 5,
+        connectionRetries: IS_VERCEL ? 2 : 25,
+        retryDelay: IS_VERCEL ? 500 : 2000,
+        timeout: IS_VERCEL ? 8 : 10,
+        autoReconnect: !IS_VERCEL,
+        requestRetries: IS_VERCEL ? 2 : 5,
+        useWSS: true,
         baseLogger: createQuietLogger(),
       }
     );
@@ -194,6 +283,24 @@ export async function disconnectCachedClient(
   }
 }
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function sendTelegramAuthCode(params: {
   apiId: number;
   apiHash: string;
@@ -201,45 +308,73 @@ export async function sendTelegramAuthCode(params: {
 }): Promise<{ authId: string; isCodeViaApp: boolean }> {
   const apiId = Number(params.apiId);
   const apiHash = params.apiHash.trim();
-  const phoneNumber = params.phoneNumber.trim();
+  const phoneNumber = normalizePhoneNumber(params.phoneNumber);
 
   if (!apiId || Number.isNaN(apiId)) {
-    throw new Error("Valid Telegram API ID is required.");
+    throw new Error("সঠিক Telegram API ID দিন (my.telegram.org থেকে প্রাপ্ত)।");
   }
-  if (!apiHash) {
-    throw new Error("Telegram API Hash is required.");
+  if (!apiHash || apiHash.length < 16) {
+    throw new Error("সঠিক Telegram API Hash দিন (my.telegram.org থেকে প্রাপ্ত)।");
   }
-  if (!phoneNumber || !phoneNumber.startsWith("+")) {
+  if (!/^\+\d{7,15}$/.test(phoneNumber)) {
     throw new Error(
-      "Phone number must include country code (e.g. +8801XXXXXXXXX)."
+      "দেশের কোডসহ সঠিক ফোন নম্বর দিন (যেমন +8801XXXXXXXXX)।"
     );
   }
 
-  const client = new TelegramClient(new StringSession(""), apiId, apiHash, {
-    connectionRetries: 5,
-    baseLogger: createQuietLogger(),
-  });
+  let lastErr: unknown;
 
-  try {
-    await client.connect();
-    const { phoneCodeHash, isCodeViaApp } = await client.sendCode(
-      { apiId, apiHash },
-      phoneNumber
-    );
-    const authId = crypto.randomUUID();
-    pendingAuths.set(authId, {
-      client,
-      apiId,
-      apiHash,
-      phoneNumber,
-      phoneCodeHash,
-      createdAt: Date.now(),
+  // Try port 443 MTProto first (most reliable on Vercel/cloud egress), then fallback to port 80
+  for (const useWSS of [true, false]) {
+    const client = new TelegramClient(new StringSession(""), apiId, apiHash, {
+      connectionRetries: 2,
+      retryDelay: 400,
+      timeout: 7,
+      requestRetries: 2,
+      autoReconnect: false,
+      useWSS,
+      baseLogger: createQuietLogger(),
     });
-    return { authId, isCodeViaApp };
-  } catch (err) {
-    await client.disconnect().catch(() => {});
-    throw new Error(formatMtprotoError(err));
+
+    try {
+      await withTimeout(client.connect(), 14_000, "CONNECT_TIMEOUT");
+      const { phoneCodeHash, isCodeViaApp } = await withTimeout(
+        client.sendCode({ apiId, apiHash }, phoneNumber),
+        16_000,
+        "CONNECT_TIMEOUT"
+      );
+      const sessionString = client.session.save() as unknown as string;
+      await client.disconnect().catch(() => {});
+
+      const payload: PendingAuthPayload = {
+        apiId,
+        apiHash,
+        phoneNumber,
+        phoneCodeHash,
+        sessionString,
+        createdAt: Date.now(),
+      };
+      const authId = encryptPendingAuthToken(payload);
+      pendingAuths.set(authId, payload);
+      return { authId, isCodeViaApp };
+    } catch (err) {
+      await client.disconnect().catch(() => {});
+      lastErr = err;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // Only retry alternate port on transport/timeout errors, never on invalid API/phone errors
+      const isTransportFailure =
+        errMsg.includes("CONNECT_TIMEOUT") ||
+        errMsg.includes("ETIMEDOUT") ||
+        errMsg.includes("ECONNREFUSED") ||
+        errMsg.includes("ECONNRESET") ||
+        errMsg.includes("Not connected");
+      if (!isTransportFailure) {
+        throw new Error(formatMtprotoError(err));
+      }
+    }
   }
+
+  throw new Error(formatMtprotoError(lastErr));
 }
 
 export async function verifyTelegramAuthCode(params: {
@@ -247,7 +382,7 @@ export async function verifyTelegramAuthCode(params: {
   code?: string;
   password?: string;
 }): Promise<
-  | { requires2FA: true; signedIn: false }
+  | { requires2FA: true; signedIn: false; authId: string }
   | {
       requires2FA: false;
       signedIn: true;
@@ -262,17 +397,34 @@ export async function verifyTelegramAuthCode(params: {
       };
     }
 > {
-  const pending = pendingAuths.get(params.authId);
+  const pending =
+    decryptPendingAuthToken(params.authId) || pendingAuths.get(params.authId);
   if (!pending) {
-    throw new Error("Login session expired. Please request a new code.");
+    throw new Error(
+      "লগইন সেশনের মেয়াদ শেষ হয়েছে। অনুগ্রহ করে আবার 'লগইন কোড পাঠান' বাটনে ক্লিক করুন।"
+    );
   }
 
-  const { client, apiId, apiHash, phoneNumber, phoneCodeHash } = pending;
+  const { apiId, apiHash, phoneNumber, phoneCodeHash, sessionString: tempSession } =
+    pending;
+
+  const client = new TelegramClient(
+    new StringSession(tempSession),
+    apiId,
+    apiHash,
+    {
+      connectionRetries: 2,
+      retryDelay: 400,
+      timeout: 8,
+      requestRetries: 2,
+      autoReconnect: false,
+      useWSS: true,
+      baseLogger: createQuietLogger(),
+    }
+  );
 
   try {
-    if (!client.connected) {
-      await client.connect();
-    }
+    await withTimeout(client.connect(), 14_000, "CONNECT_TIMEOUT");
 
     let signedInUser: Api.User | undefined;
 
@@ -290,7 +442,7 @@ export async function verifyTelegramAuthCode(params: {
     } else {
       const code = (params.code || "").trim();
       if (!code) {
-        throw new Error("Verification code is required.");
+        throw new Error("টেলিগ্রাম থেকে পাওয়া ভেরিফিকেশন কোডটি লিখুন।");
       }
 
       try {
@@ -311,7 +463,20 @@ export async function verifyTelegramAuthCode(params: {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("SESSION_PASSWORD_NEEDED")) {
           if (!params.password) {
-            return { requires2FA: true, signedIn: false };
+            const updatedSession = client.session.save() as unknown as string;
+            await client.disconnect().catch(() => {});
+            const updatedPayload: PendingAuthPayload = {
+              ...pending,
+              sessionString: updatedSession || pending.sessionString,
+              createdAt: Date.now(),
+            };
+            const refreshedAuthId = encryptPendingAuthToken(updatedPayload);
+            pendingAuths.set(refreshedAuthId, updatedPayload);
+            return {
+              requires2FA: true,
+              signedIn: false,
+              authId: refreshedAuthId,
+            };
           }
           const res = await client.signInWithPassword(
             { apiId, apiHash },
@@ -337,8 +502,12 @@ export async function verifyTelegramAuthCode(params: {
     const sessionString = client.session.save() as unknown as string;
     pendingAuths.delete(params.authId);
 
-    const cacheKey = `${apiId}:${sessionString.slice(0, 24)}`;
-    activeClients.set(cacheKey, client);
+    if (IS_VERCEL) {
+      await client.disconnect().catch(() => {});
+    } else {
+      const cacheKey = `${apiId}:${sessionString.slice(0, 24)}`;
+      activeClients.set(cacheKey, client);
+    }
 
     const fullName = [signedInUser?.firstName, signedInUser?.lastName]
       .filter(Boolean)
@@ -359,6 +528,7 @@ export async function verifyTelegramAuthCode(params: {
       },
     };
   } catch (err) {
+    await client.disconnect().catch(() => {});
     throw new Error(formatMtprotoError(err));
   }
 }

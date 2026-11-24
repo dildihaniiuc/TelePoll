@@ -124,20 +124,66 @@ export function ChannelSettings({
     }
   }, [config?.hasUserSession]);
 
+  const safeReadJson = async (res: Response): Promise<Record<string, any>> => {
+    const raw = await res.text();
+    try {
+      return raw ? (JSON.parse(raw) as Record<string, any>) : {};
+    } catch {
+      const compact = raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      throw new Error(
+        compact
+          ? `Server error (${res.status}): ${compact.slice(0, 140)}`
+          : `Server returned HTTP ${res.status}`
+      );
+    }
+  };
+
   const handleSendCode = async () => {
     setDirectError(null);
+    const cleanApiId = apiId.trim();
+    const cleanApiHash = apiHash.trim();
+    const cleanPhone = phoneNumber.trim();
+
+    if (!cleanApiId) {
+      const msg =
+        lang === "bn"
+          ? "my.telegram.org থেকে পাওয়া API ID দিন।"
+          : "Please enter your Telegram API ID from my.telegram.org.";
+      setDirectError(msg);
+      onNotify("error", msg);
+      return;
+    }
+    if (!cleanApiHash && !config?.hasApiCredentials) {
+      const msg =
+        lang === "bn"
+          ? "my.telegram.org থেকে পাওয়া API Hash দিন।"
+          : "Please enter your Telegram API Hash from my.telegram.org.";
+      setDirectError(msg);
+      onNotify("error", msg);
+      return;
+    }
+    if (!cleanPhone) {
+      const msg =
+        lang === "bn"
+          ? "দেশের কোডসহ ফোন নম্বর লিখুন (যেমন +8801XXXXXXXXX)।"
+          : "Please enter your phone number with country code (e.g. +8801XXXXXXXXX).";
+      setDirectError(msg);
+      onNotify("error", msg);
+      return;
+    }
+
     setIsSendingCode(true);
     try {
       const res = await fetch("/api/telegram/user/send-code", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiId: apiId.trim(),
-          apiHash: apiHash.trim() || undefined,
-          phoneNumber: phoneNumber.trim(),
+          apiId: cleanApiId,
+          apiHash: cleanApiHash || undefined,
+          phoneNumber: cleanPhone,
         }),
       });
-      const data = await res.json();
+      const data = await safeReadJson(res);
       if (!res.ok) throw new Error(data.error || "Failed to send login code");
       setAuthId(data.authId);
       setRequires2FA(false);
@@ -173,10 +219,13 @@ export function ChannelSettings({
           password: twoFaPassword || undefined,
         }),
       });
-      const data = await res.json();
+      const data = await safeReadJson(res);
       if (!res.ok) throw new Error(data.error || "Sign in failed");
 
       if (data.requires2FA) {
+        if (typeof data.authId === "string" && data.authId) {
+          setAuthId(data.authId);
+        }
         setRequires2FA(true);
         return;
       }

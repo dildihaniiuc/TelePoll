@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "http";
-import { createExpressApp } from "../server.ts";
+import { createExpressApp } from "../server/app.ts";
 
 export const config = {
   maxDuration: 60,
