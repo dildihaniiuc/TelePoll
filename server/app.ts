@@ -34,6 +34,7 @@ import {
   postPhotoAsUser,
   postPollAsUser,
   postTextAsUser,
+  resendTelegramAuthCode,
   searchAndIndexChannelPostsAsUser,
   sendTelegramAuthCode,
   sendUserGroupGreeting,
@@ -482,6 +483,24 @@ export function createExpressApp(): express.Express {
           err instanceof Error
             ? err.message
             : "Failed to send verification code",
+      });
+    }
+  });
+
+  app.post("/api/telegram/user/resend-code", async (req, res) => {
+    try {
+      const { authId } = req.body as { authId?: string };
+      if (!authId) {
+        return res.status(400).json({ error: "Missing login session ID." });
+      }
+      const result = await resendTelegramAuthCode(authId);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : "Failed to resend verification code",
       });
     }
   });

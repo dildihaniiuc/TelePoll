@@ -44,10 +44,12 @@ export function ChannelSettings({
   const [apiHash, setApiHash] = useState("");
   const [phoneNumber, setPhoneNumber] = useState(config?.userPhone ?? "");
   const [authId, setAuthId] = useState<string | null>(null);
+  const [codeViaApp, setCodeViaApp] = useState<boolean>(true);
   const [otpCode, setOtpCode] = useState("");
   const [requires2FA, setRequires2FA] = useState(false);
   const [twoFaPassword, setTwoFaPassword] = useState("");
   const [isSendingCode, setIsSendingCode] = useState(false);
+  const [isResendingCode, setIsResendingCode] = useState(false);
   const [isVerifyingLogin, setIsVerifyingLogin] = useState(false);
   const [directError, setDirectError] = useState<string | null>(null);
 
@@ -186,15 +188,20 @@ export function ChannelSettings({
       const data = await safeReadJson(res);
       if (!res.ok) throw new Error(data.error || "Failed to send login code");
       setAuthId(data.authId);
+      setCodeViaApp(Boolean(data.isCodeViaApp));
       setRequires2FA(false);
       setOtpCode("");
       setTwoFaPassword("");
       void syncSessionVault();
       onNotify(
         "success",
-        lang === "bn"
-          ? "আপনার টেলিগ্রাম অ্যাপে ভেরিফিকেশন কোড পাঠানো হয়েছে।"
-          : "Verification code sent to your Telegram app."
+        data.isCodeViaApp
+          ? lang === "bn"
+            ? "আপনার টেলিগ্রাম অ্যাপে (Telegram চ্যাট) কোড পাঠানো হয়েছে!"
+            : "Verification code sent to your Telegram app chat!"
+          : lang === "bn"
+            ? "আপনার ফোনে SMS/কল-এর মাধ্যমে ভেরিফিকেশন কোড পাঠানো হয়েছে।"
+            : "Verification code sent via SMS/call."
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to send code";
@@ -202,6 +209,39 @@ export function ChannelSettings({
       onNotify("error", msg);
     } finally {
       setIsSendingCode(false);
+    }
+  };
+
+  const handleResendCode = async () => {
+    if (!authId) return;
+    setDirectError(null);
+    setIsResendingCode(true);
+    try {
+      const res = await fetch("/api/telegram/user/resend-code", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ authId }),
+      });
+      const data = await safeReadJson(res);
+      if (!res.ok) throw new Error(data.error || "Failed to resend code");
+      if (data.authId) setAuthId(data.authId);
+      setCodeViaApp(Boolean(data.isCodeViaApp));
+      onNotify(
+        "success",
+        data.isCodeViaApp
+          ? lang === "bn"
+            ? "টেলিগ্রাম অ্যাপে পুনরায় কোড পাঠানো হয়েছে।"
+            : "Code resent to your Telegram app."
+          : lang === "bn"
+            ? "SMS/কল-এর মাধ্যমে নতুন কোড পাঠানো হয়েছে।"
+            : "New code sent via SMS."
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to resend code";
+      setDirectError(msg);
+      onNotify("error", msg);
+    } finally {
+      setIsResendingCode(false);
     }
   };
 
@@ -793,18 +833,30 @@ export function ChannelSettings({
               ) : (
                 <>
                   {!requires2FA ? (
-                    <div>
-                      <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                        {t.otpLabel}
-                      </label>
-                      <input
-                        type="text"
-                        inputMode="numeric"
-                        value={otpCode}
-                        onChange={(e) => setOtpCode(e.target.value)}
-                        placeholder={t.otpPlaceholder}
-                        className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
-                      />
+                    <div className="space-y-3">
+                      <div className="px-3.5 py-2.5 text-xs text-emerald-200 bg-emerald-950/35 border border-emerald-500/35 rounded-sm leading-relaxed">
+                        {codeViaApp
+                          ? lang === "bn"
+                            ? "কোডটি আপনার টেলিগ্রাম অ্যাপের ভেতরে অফিসিয়াল 'Telegram' চ্যাটে (777000) পাঠানো হয়েছে (মোবাইল SMS-এ নয়)।"
+                            : "Code sent inside your Telegram app in the official 'Telegram' service chat (not SMS)."
+                          : lang === "bn"
+                            ? "কোডটি আপনার ফোন নম্বরে SMS/কল-এর মাধ্যমে পাঠানো হয়েছে।"
+                            : "Code sent to your phone number via SMS/call."}
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                          {t.otpLabel}
+                        </label>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          value={otpCode}
+                          onChange={(e) => setOtpCode(e.target.value)}
+                          placeholder={t.otpPlaceholder}
+                          className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
+                        />
+                      </div>
                     </div>
                   ) : (
                     <div>
@@ -827,18 +879,36 @@ export function ChannelSettings({
                     </div>
                   )}
 
-                  <div className="flex items-center justify-between gap-3 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setAuthId(null);
-                        setRequires2FA(false);
-                        setDirectError(null);
-                      }}
-                      className="text-xs font-medium text-slate-400 hover:text-slate-100 cursor-pointer"
-                    >
-                      {t.restartLoginBtn}
-                    </button>
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                    <div className="flex items-center gap-4">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthId(null);
+                          setRequires2FA(false);
+                          setDirectError(null);
+                        }}
+                        className="text-xs font-medium text-slate-400 hover:text-slate-100 cursor-pointer"
+                      >
+                        {t.restartLoginBtn}
+                      </button>
+
+                      {!requires2FA && (
+                        <button
+                          type="button"
+                          onClick={handleResendCode}
+                          disabled={isResendingCode}
+                          className="inline-flex items-center gap-1.5 text-xs font-medium text-cyan-300 hover:text-cyan-200 disabled:opacity-60 cursor-pointer"
+                        >
+                          {isResendingCode && (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          )}
+                          {lang === "bn"
+                            ? "আবার কোড পাঠান (SMS)"
+                            : "Resend Code (SMS)"}
+                        </button>
+                      )}
+                    </div>
 
                     <button
                       type="button"

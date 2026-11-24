@@ -337,10 +337,10 @@ export async function sendTelegramAuthCode(params: {
     });
 
     try {
-      await withTimeout(client.connect(), 14_000, "CONNECT_TIMEOUT");
+      await withTimeout(client.connect(), 9_000, "CONNECT_TIMEOUT");
       const { phoneCodeHash, isCodeViaApp } = await withTimeout(
         client.sendCode({ apiId, apiHash }, phoneNumber),
-        16_000,
+        12_000,
         "CONNECT_TIMEOUT"
       );
       const sessionString = client.session.save() as unknown as string;
@@ -375,6 +375,69 @@ export async function sendTelegramAuthCode(params: {
   }
 
   throw new Error(formatMtprotoError(lastErr));
+}
+
+export async function resendTelegramAuthCode(
+  rawAuthId: string
+): Promise<{ authId: string; isCodeViaApp: boolean }> {
+  const pending =
+    decryptPendingAuthToken(rawAuthId) || pendingAuths.get(rawAuthId);
+  if (!pending) {
+    throw new Error(
+      "লগইন সেশনের মেয়াদ শেষ হয়েছে। অনুগ্রহ করে আবার 'লগইন কোড পাঠান' বাটনে ক্লিক করুন।"
+    );
+  }
+
+  const client = new TelegramClient(
+    new StringSession(pending.sessionString),
+    pending.apiId,
+    pending.apiHash,
+    {
+      connectionRetries: 2,
+      retryDelay: 400,
+      timeout: 8,
+      requestRetries: 2,
+      autoReconnect: false,
+      useWSS: true,
+      baseLogger: createQuietLogger(),
+    }
+  );
+
+  try {
+    await withTimeout(client.connect(), 10_000, "CONNECT_TIMEOUT");
+    const res = await withTimeout(
+      client.invoke(
+        new Api.auth.ResendCode({
+          phoneNumber: pending.phoneNumber,
+          phoneCodeHash: pending.phoneCodeHash,
+        })
+      ),
+      10_000,
+      "CONNECT_TIMEOUT"
+    );
+
+    if (res instanceof Api.auth.SentCodeSuccess) {
+      throw new Error("ইতিমধ্যেই লগইন সম্পন্ন হয়েছে। অনুগ্রহ করে পেজ রিলোড করুন।");
+    }
+
+    const nextHash = res.phoneCodeHash || pending.phoneCodeHash;
+    const isCodeViaApp = res.type instanceof Api.auth.SentCodeTypeApp;
+    const updatedSession = client.session.save() as unknown as string;
+    await client.disconnect().catch(() => {});
+
+    const nextPayload: PendingAuthPayload = {
+      ...pending,
+      phoneCodeHash: nextHash,
+      sessionString: updatedSession || pending.sessionString,
+      createdAt: Date.now(),
+    };
+    const nextAuthId = encryptPendingAuthToken(nextPayload);
+    pendingAuths.set(nextAuthId, nextPayload);
+    return { authId: nextAuthId, isCodeViaApp };
+  } catch (err) {
+    await client.disconnect().catch(() => {});
+    throw new Error(formatMtprotoError(err));
+  }
 }
 
 export async function verifyTelegramAuthCode(params: {
