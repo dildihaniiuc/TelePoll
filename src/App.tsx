@@ -18,6 +18,9 @@ import {
   syncSessionVault,
 } from "./lib/sessionVault";
 import { BinaryRainBackground } from "./components/BinaryRainBackground";
+import { PWAInstallButton } from "./components/PWAInstallButton";
+import { OfflineIndicator } from "./components/OfflineIndicator";
+import { HackerWelcomeBanner } from "./components/HackerWelcomeBanner";
 
 type ActiveTab = "studio" | "queue" | "channel";
 
@@ -60,6 +63,9 @@ export default function App() {
           }
         } else {
           setConfig(data);
+          if (data.hasUserSession || data.hasBotToken) {
+            void syncSessionVault();
+          }
         }
         vaultReadyRef.current = true;
       }
@@ -110,6 +116,7 @@ export default function App() {
 
   useEffect(() => {
     if (!vaultReadyRef.current || !config) return;
+    if (!config.hasUserSession && !config.hasBotToken) return;
     const timer = window.setTimeout(() => {
       void syncSessionVault();
     }, 400);
@@ -138,7 +145,7 @@ export default function App() {
   ];
 
   return (
-    <div className="relative min-h-screen flex terminal-grid-bg text-slate-100">
+    <div className="relative min-h-screen flex terminal-grid-bg text-slate-100 overflow-x-hidden">
       <BinaryRainBackground />
 
       {/* Mobile Sidebar Backdrop */}
@@ -215,37 +222,41 @@ export default function App() {
           })}
         </nav>
 
-        {/* Upcoming Post Footer Summary */}
-        <div className="p-4 border-t border-emerald-500/25 space-y-1.5 text-xs">
-          <div className="font-mono text-[11px] text-slate-400">
-            {t.nextScheduledLabel}
-          </div>
-          {upcomingJob ? (
-            <button
-              type="button"
-              onClick={() => setActiveTab("queue")}
-              className="w-full text-left space-y-0.5 hover:text-emerald-300 transition-colors cursor-pointer"
-            >
-              <div className="font-mono tabular-nums text-emerald-400 font-medium">
-                {new Date(upcomingJob.scheduledAt).toLocaleString(
-                  lang === "bn" ? "bn-BD" : "en-US",
-                  {
-                    month: "short",
-                    day: "numeric",
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  }
-                )}
-              </div>
-              <div className="text-slate-400 truncate">
-                {upcomingJob.question}
-              </div>
-            </button>
-          ) : (
-            <div className="text-slate-500 font-mono text-[11px]">
-              {t.noUpcomingLabel}
+        {/* Install PWA + Upcoming Post Footer Summary */}
+        <div className="p-4 border-t border-emerald-500/25 space-y-3 text-xs">
+          <PWAInstallButton lang={lang} />
+
+          <div className="space-y-1.5">
+            <div className="font-mono text-[11px] text-slate-400">
+              {t.nextScheduledLabel}
             </div>
-          )}
+            {upcomingJob ? (
+              <button
+                type="button"
+                onClick={() => setActiveTab("queue")}
+                className="w-full text-left space-y-0.5 hover:text-emerald-300 transition-colors cursor-pointer"
+              >
+                <div className="font-mono tabular-nums text-emerald-400 font-medium">
+                  {new Date(upcomingJob.scheduledAt).toLocaleString(
+                    lang === "bn" ? "bn-BD" : "en-US",
+                    {
+                      month: "short",
+                      day: "numeric",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    }
+                  )}
+                </div>
+                <div className="text-slate-400 truncate">
+                  {upcomingJob.question}
+                </div>
+              </button>
+            ) : (
+              <div className="text-slate-500 font-mono text-[11px]">
+                {t.noUpcomingLabel}
+              </div>
+            )}
+          </div>
         </div>
       </aside>
 
@@ -310,7 +321,16 @@ export default function App() {
         </header>
 
         {/* Active Viewport */}
-        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto space-y-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex-1 min-w-[220px]">
+              <HackerWelcomeBanner />
+            </div>
+            <div className="lg:hidden shrink-0">
+              <PWAInstallButton lang={lang} compact />
+            </div>
+          </div>
+
           {activeTab === "studio" && (
             <AgentStudio
               lang={lang}
@@ -368,6 +388,7 @@ export default function App() {
           </button>
         </div>
       )}
+      <OfflineIndicator lang={lang} />
     </div>
   );
 }

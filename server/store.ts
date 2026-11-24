@@ -23,6 +23,9 @@ const DEFAULT_STORE: AgentStoreData = {
   jobs: [],
 };
 
+// In-memory safety cache prevents transient read errors from dropping an active session
+let lastKnownGoodStore: AgentStoreData | null = null;
+
 function applyEnvDefaults(config: TelegramConfig): TelegramConfig {
   const next = { ...config };
   const envApiId = Number(process.env.TELEGRAM_API_ID || 0);
@@ -51,10 +54,15 @@ function ensureStore(): void {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
   if (!fs.existsSync(STORE_PATH)) {
-    const initial: AgentStoreData = {
-      config: applyEnvDefaults({ ...DEFAULT_STORE.config }),
-      jobs: [],
-    };
+    const initial: AgentStoreData = lastKnownGoodStore
+      ? {
+          config: applyEnvDefaults({ ...lastKnownGoodStore.config }),
+          jobs: [...lastKnownGoodStore.jobs],
+        }
+      : {
+          config: applyEnvDefaults({ ...DEFAULT_STORE.config }),
+          jobs: [],
+        };
     fs.writeFileSync(STORE_PATH, JSON.stringify(initial, null, 2), "utf-8");
   }
 }
@@ -64,14 +72,22 @@ export function readStore(): AgentStoreData {
   try {
     const raw = fs.readFileSync(STORE_PATH, "utf-8");
     const parsed = JSON.parse(raw) as Partial<AgentStoreData>;
-    return {
+    const store: AgentStoreData = {
       config: applyEnvDefaults({
         ...DEFAULT_STORE.config,
         ...(parsed.config ?? {}),
       }),
       jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
     };
+    lastKnownGoodStore = store;
+    return store;
   } catch {
+    if (lastKnownGoodStore) {
+      return {
+        config: applyEnvDefaults({ ...lastKnownGoodStore.config }),
+        jobs: [...lastKnownGoodStore.jobs],
+      };
+    }
     return {
       config: applyEnvDefaults({ ...DEFAULT_STORE.config }),
       jobs: [],
@@ -80,8 +96,9 @@ export function readStore(): AgentStoreData {
 }
 
 export function writeStore(data: AgentStoreData): void {
+  lastKnownGoodStore = data;
   ensureStore();
-  const tmpPath = `${STORE_PATH}.tmp`;
+  const tmpPath = `${STORE_PATH}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
   fs.renameSync(tmpPath, STORE_PATH);
 }
@@ -173,19 +190,37 @@ export function restoreBackupBundle(bundle: Partial<AgentStoreData>): {
     return { restored: false, store: current };
   }
 
-  const hasCurrentAuth = Boolean(
-    (current.config.sessionString && current.config.apiId && current.config.apiHash) ||
-      current.config.botToken
+  const hasCurrentUserAuth = Boolean(
+    current.config.sessionString && current.config.apiId && current.config.apiHash
   );
+  const hasCurrentBotAuth = Boolean(current.config.botToken);
 
-  // Merge missing credentials & preferences without wiping newer state if already connected
-  const mergedConfig: TelegramConfig = hasCurrentAuth
-    ? current.config
-    : {
-        ...DEFAULT_STORE.config,
-        ...current.config,
-        ...incomingCfg,
-      };
+  const mergedConfig: TelegramConfig = {
+    ...DEFAULT_STORE.config,
+    ...incomingCfg,
+    ...current.config,
+    // Prefer whichever credential is missing on current server instance
+    apiId: current.config.apiId || incomingCfg.apiId,
+    apiHash: current.config.apiHash || incomingCfg.apiHash,
+    sessionString: current.config.sessionString || incomingCfg.sessionString,
+    userId: current.config.userId || incomingCfg.userId,
+    userDisplayName: current.config.userDisplayName || incomingCfg.userDisplayName,
+    userUsername: current.config.userUsername || incomingCfg.userUsername,
+    userPhone: current.config.userPhone || incomingCfg.userPhone,
+    botToken: current.config.botToken || incomingCfg.botToken || "",
+    botUsername: current.config.botUsername || incomingCfg.botUsername,
+    channelId: current.config.channelId || incomingCfg.channelId || "",
+    channelTitle: current.config.channelTitle || incomingCfg.channelTitle,
+    channelType: current.config.channelType || incomingCfg.channelType,
+    verifiedAt: current.config.verifiedAt || incomingCfg.verifiedAt,
+    controlGroupId: current.config.controlGroupId || incomingCfg.controlGroupId,
+    controlGroupTitle:
+      current.config.controlGroupTitle || incomingCfg.controlGroupTitle,
+    authMode:
+      hasCurrentUserAuth || hasCurrentBotAuth
+        ? current.config.authMode
+        : incomingCfg.authMode || current.config.authMode,
+  };
 
   const existingIds = new Set(current.jobs.map((j) => j.id));
   const incomingJobs = Array.isArray(bundle.jobs)
@@ -197,6 +232,16 @@ export function restoreBackupBundle(bundle: Partial<AgentStoreData>): {
     jobs: [...current.jobs, ...incomingJobs].slice(0, 200),
   };
 
+  const didRestoreCredentials =
+    (!hasCurrentUserAuth &&
+      Boolean(
+        mergedConfig.sessionString && mergedConfig.apiId && mergedConfig.apiHash
+      )) ||
+    (!hasCurrentBotAuth && Boolean(mergedConfig.botToken));
+
   writeStore(nextStore);
-  return { restored: !hasCurrentAuth || incomingJobs.length > 0, store: nextStore };
+  return {
+    restored: didRestoreCredentials || incomingJobs.length > 0,
+    store: nextStore,
+  };
 }

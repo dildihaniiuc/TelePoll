@@ -191,8 +191,8 @@ export function TelegramPollPreview({
             </div>
           </div>
         ) : (
-          <div className="p-5 bg-[#070B10]/80">
-            <div className="bg-[#0B121A] border border-slate-800 rounded-sm overflow-hidden">
+          <div className="p-5 bg-[#0A121B]/85">
+            <div className="bg-[#121F2E] border border-emerald-500/30 rounded-sm overflow-hidden">
               <div className="flex items-center justify-between gap-2 px-4 py-2.5 border-b border-slate-800/80">
                 <span className="text-xs font-mono font-medium text-cyan-400">
                   {channelLabel}
@@ -265,8 +265,8 @@ export function TelegramPollPreview({
             </div>
           </div>
         ) : (
-          <div className="p-5 bg-[#070B10]/80">
-            <div className="bg-[#0B121A] border border-slate-800 rounded-sm p-4 space-y-2.5">
+          <div className="p-5 bg-[#0A121B]/85">
+            <div className="bg-[#121F2E] border border-emerald-500/30 rounded-sm p-4 space-y-2.5">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-mono font-medium text-cyan-400">
                   {channelLabel}
@@ -477,13 +477,13 @@ export function TelegramPollPreview({
         </div>
       ) : (
         /* Realistic Dark Telegram Channel Preview */
-        <div className="p-5 bg-[#070B10]/80">
+        <div className="p-5 bg-[#0A121B]/85">
           {poll.caption && poll.caption.trim() && (
-            <div className="mb-3 px-4 py-2.5 bg-[#0B121A] border border-slate-800 rounded-sm text-sm text-slate-200">
+            <div className="mb-3 px-4 py-2.5 bg-[#121F2E] border border-emerald-500/30 rounded-sm text-sm text-slate-200">
               {poll.caption}
             </div>
           )}
-          <div className="bg-[#0B121A] border border-slate-800 rounded-sm p-4 space-y-3">
+          <div className="bg-[#121F2E] border border-emerald-500/30 rounded-sm p-4 space-y-3">
             <div className="flex items-start justify-between gap-3">
               <div className="space-y-1">
                 <div className="text-xs font-mono font-medium text-cyan-400">
@@ -528,7 +528,7 @@ export function TelegramPollPreview({
                             ? "border-emerald-500 bg-emerald-950/50 text-emerald-200"
                             : "border-rose-500/60 bg-rose-950/40 text-rose-200"
                           : "border-cyan-500/60 bg-cyan-950/35 text-cyan-100"
-                        : "border-slate-800 bg-[#070B10] hover:border-slate-700 text-slate-200"
+                        : "border-slate-700/80 bg-[#0B1520] hover:border-emerald-400/50 text-slate-100"
                     }`}
                   >
                     <span className="flex items-center gap-2.5">

@@ -131,7 +131,7 @@ export function BinaryRainBackground() {
       <canvas
         ref={canvasRef}
         aria-hidden="true"
-        className="fixed inset-0 pointer-events-none z-0 opacity-65"
+        className="fixed inset-0 pointer-events-none z-0 opacity-50"
       />
       <div
         aria-hidden="true"

@@ -26,6 +26,7 @@ interface PendingAuth {
 
 const pendingAuths = new Map<string, PendingAuth>();
 const activeClients = new Map<string, TelegramClient>();
+const connectingPromises = new Map<string, Promise<TelegramClient>>();
 
 // Track messages sent by our agent to guarantee zero infinite loops
 const sentByAgentMsgIds = new Set<number>();
@@ -130,28 +131,54 @@ async function getConnectedClient(
     return existing;
   }
 
-  const client = new TelegramClient(
-    new StringSession(sessionString),
-    apiId,
-    apiHash,
-    {
-      connectionRetries: 15,
-      retryDelay: 2000,
-      autoReconnect: true,
-      requestRetries: 5,
-      baseLogger: createQuietLogger(),
-    }
-  );
-  await client.connect();
-  const authorized = await client.isUserAuthorized();
-  if (!authorized) {
-    await client.disconnect().catch(() => {});
-    throw new Error(
-      "Telegram session is no longer authorized. Please sign in again."
-    );
+  const inflight = connectingPromises.get(cacheKey);
+  if (inflight) {
+    return inflight;
   }
-  activeClients.set(cacheKey, client);
-  return client;
+
+  const connectPromise = (async () => {
+    if (existing) {
+      try {
+        await existing.connect();
+        if (existing.connected) {
+          return existing;
+        }
+      } catch {
+        await existing.disconnect().catch(() => {});
+        activeClients.delete(cacheKey);
+      }
+    }
+
+    const client = new TelegramClient(
+      new StringSession(sessionString),
+      apiId,
+      apiHash,
+      {
+        connectionRetries: 25,
+        retryDelay: 2000,
+        autoReconnect: true,
+        requestRetries: 5,
+        baseLogger: createQuietLogger(),
+      }
+    );
+    await client.connect();
+    const authorized = await client.isUserAuthorized();
+    if (!authorized) {
+      await client.disconnect().catch(() => {});
+      throw new Error(
+        "Telegram session is no longer authorized. Please sign in again."
+      );
+    }
+    activeClients.set(cacheKey, client);
+    return client;
+  })();
+
+  connectingPromises.set(cacheKey, connectPromise);
+  try {
+    return await connectPromise;
+  } finally {
+    connectingPromises.delete(cacheKey);
+  }
 }
 
 export async function disconnectCachedClient(

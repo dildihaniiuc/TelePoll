@@ -11,7 +11,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { COPY } from "../i18n";
-import { syncSessionVault } from "../lib/sessionVault";
+import { clearSessionVault, syncSessionVault } from "../lib/sessionVault";
 import type {
   AgentTriggerMode,
   PublicTelegramConfig,
@@ -83,6 +83,8 @@ export function ChannelSettings({
   );
   const [isUpdatingListener, setIsUpdatingListener] = useState(false);
   const [listenerError, setListenerError] = useState<string | null>(null);
+  const [confirmDisconnectUser, setConfirmDisconnectUser] = useState(false);
+  const [confirmClearToken, setConfirmClearToken] = useState(false);
 
   useEffect(() => {
     if (config) {
@@ -235,20 +237,26 @@ export function ChannelSettings({
   };
 
   const handleDisconnectUser = async () => {
+    if (!confirmDisconnectUser) {
+      setConfirmDisconnectUser(true);
+      window.setTimeout(() => setConfirmDisconnectUser(false), 6000);
+      return;
+    }
+    setConfirmDisconnectUser(false);
     try {
       const res = await fetch("/api/telegram/user/session", {
         method: "DELETE",
       });
       const data = await res.json();
+      await clearSessionVault("user");
       onConfigUpdated(data);
-      void syncSessionVault();
       setChannels([]);
       setAuthId(null);
       onNotify(
         "success",
         lang === "bn"
-          ? "টেলিগ্রাম অ্যাকাউন্ট ডিসকানেক্ট করা হয়েছে।"
-          : "Telegram account disconnected."
+          ? "টেলিগ্রাম অ্যাকাউন্ট ম্যানুয়ালি ডিসকানেক্ট করা হয়েছে।"
+          : "Telegram account manually disconnected."
       );
     } catch {
       onNotify("error", "Failed to disconnect account.");
@@ -291,14 +299,22 @@ export function ChannelSettings({
   };
 
   const handleClearBotToken = async () => {
+    if (!confirmClearToken) {
+      setConfirmClearToken(true);
+      window.setTimeout(() => setConfirmClearToken(false), 6000);
+      return;
+    }
+    setConfirmClearToken(false);
     try {
       const res = await fetch("/api/telegram/token", { method: "DELETE" });
       const data = await res.json();
+      await clearSessionVault("bot");
       onConfigUpdated(data);
-      void syncSessionVault();
       onNotify(
         "success",
-        lang === "bn" ? "বট টোকেন মুছে ফেলা হয়েছে।" : "Bot token cleared."
+        lang === "bn"
+          ? "বট টোকেন ম্যানুয়ালি মুছে ফেলা হয়েছে।"
+          : "Bot token manually cleared."
       );
     } catch {
       onNotify("error", "Failed to clear token.");
@@ -464,6 +480,11 @@ export function ChannelSettings({
                   <div className="text-xs text-slate-400 font-mono mt-0.5">
                     {config.userPhone} · ID {config.userId}
                   </div>
+                  <div className="text-[11px] text-emerald-400/90 mt-1">
+                    {lang === "bn"
+                      ? "সেশন স্থায়ীভাবে সংরক্ষিত — ম্যানুয়ালি ডিসকানেক্ট না করা পর্যন্ত লগইন থাকবে"
+                      : "Persistent session locked — stays signed in until manually disconnected"}
+                  </div>
                 </div>
 
                 <div className="flex items-center gap-2">
@@ -483,10 +504,18 @@ export function ChannelSettings({
                   <button
                     type="button"
                     onClick={handleDisconnectUser}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-rose-300 bg-rose-950/35 border border-rose-500/35 rounded-sm hover:bg-rose-950/60 transition-colors cursor-pointer"
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-sm border transition-colors cursor-pointer ${
+                      confirmDisconnectUser
+                        ? "text-white bg-rose-600 border-rose-400 hover:bg-rose-500"
+                        : "text-rose-300 bg-rose-950/35 border-rose-500/35 hover:bg-rose-950/60"
+                    }`}
                   >
                     <LogOut className="w-3.5 h-3.5" />
-                    {t.disconnectAccountBtn}
+                    {confirmDisconnectUser
+                      ? lang === "bn"
+                        ? "নিশ্চিত ডিসকানেক্ট?"
+                        : "Confirm Disconnect?"
+                      : t.disconnectAccountBtn}
                   </button>
                 </div>
               </div>
@@ -807,10 +836,18 @@ export function ChannelSettings({
                 <button
                   type="button"
                   onClick={handleClearBotToken}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-rose-300 bg-rose-950/35 border border-rose-500/35 rounded-sm hover:bg-rose-950/60 transition-colors cursor-pointer"
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-sm border transition-colors cursor-pointer ${
+                    confirmClearToken
+                      ? "text-white bg-rose-600 border-rose-400 hover:bg-rose-500"
+                      : "text-rose-300 bg-rose-950/35 border-rose-500/35 hover:bg-rose-950/60"
+                  }`}
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                  {t.clearTokenBtn}
+                  {confirmClearToken
+                    ? lang === "bn"
+                      ? "নিশ্চিত মুছবেন?"
+                      : "Confirm Clear?"
+                    : t.clearTokenBtn}
                 </button>
               )}
             </div>
