@@ -28,7 +28,9 @@ import {
   verifyTelegramConnection,
 } from "./telegram.ts";
 import {
+  checkTelegramQrLogin,
   disconnectCachedClient,
+  importTelegramSession,
   isUserListenerActive,
   listUserTelegramChannels,
   postPhotoAsUser,
@@ -38,6 +40,7 @@ import {
   searchAndIndexChannelPostsAsUser,
   sendTelegramAuthCode,
   sendUserGroupGreeting,
+  startTelegramQrLogin,
   startUserGroupListener,
   stopUserGroupListener,
   verifyTelegramAuthCode,
@@ -563,6 +566,164 @@ export function createExpressApp(): express.Express {
         error: err instanceof Error ? err.message : "Verification failed",
       });
     }
+  });
+
+  app.post("/api/telegram/user/qr-start", async (req, res) => {
+    try {
+      const { apiId, apiHash } = (req.body || {}) as {
+        apiId?: number | string;
+        apiHash?: string;
+      };
+      const store = readStore();
+      const resolvedApiId = Number(apiId || store.config.apiId);
+      const resolvedApiHash = String(apiHash || store.config.apiHash || "").trim();
+
+      const result = await startTelegramQrLogin({
+        apiId: resolvedApiId,
+        apiHash: resolvedApiHash,
+      });
+
+      updateConfig({
+        apiId: resolvedApiId,
+        apiHash: resolvedApiHash,
+      });
+
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : "Failed to start QR login session",
+      });
+    }
+  });
+
+  app.post("/api/telegram/user/qr-check", async (req, res) => {
+    try {
+      const { qrAuthId, password } = (req.body || {}) as {
+        qrAuthId?: string;
+        password?: string;
+      };
+      if (!qrAuthId || typeof qrAuthId !== "string") {
+        return res.status(400).json({ error: "Missing QR login session ID." });
+      }
+
+      const result = await checkTelegramQrLogin({
+        qrAuthId,
+        password: typeof password === "string" ? password : undefined,
+      });
+
+      if (result.status !== "signed_in") {
+        return res.json(result);
+      }
+
+      const updated = updateConfig({
+        authMode: "user",
+        apiId: result.apiId,
+        apiHash: result.apiHash,
+        sessionString: result.sessionString,
+        userId: result.user.id,
+        userDisplayName: result.user.displayName,
+        userUsername: result.user.username,
+        userPhone: result.user.phone,
+      });
+
+      let channels: TelegramDialogSummary[] = [];
+      try {
+        channels = await listUserTelegramChannels(
+          result.apiId,
+          result.apiHash,
+          result.sessionString
+        );
+      } catch {
+        // Non-fatal if dialog listing takes longer; user can click refresh
+      }
+
+      res.json({
+        status: "signed_in",
+        config: getPublicConfig(updated),
+        channels,
+      });
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : "QR login check failed",
+      });
+    }
+  });
+
+  app.post("/api/telegram/user/import-session", async (req, res) => {
+    try {
+      const { apiId, apiHash, sessionString } = (req.body || {}) as {
+        apiId?: number | string;
+        apiHash?: string;
+        sessionString?: string;
+      };
+      const store = readStore();
+      const resolvedApiId = Number(apiId || store.config.apiId);
+      const resolvedApiHash = String(apiHash || store.config.apiHash || "").trim();
+      const cleanedSession = String(sessionString || "").trim();
+
+      const result = await importTelegramSession({
+        apiId: resolvedApiId,
+        apiHash: resolvedApiHash,
+        sessionString: cleanedSession,
+      });
+
+      const updated = updateConfig({
+        authMode: "user",
+        apiId: result.apiId,
+        apiHash: result.apiHash,
+        sessionString: result.sessionString,
+        userId: result.user.id,
+        userDisplayName: result.user.displayName,
+        userUsername: result.user.username,
+        userPhone: result.user.phone,
+      });
+
+      let channels: TelegramDialogSummary[] = [];
+      try {
+        channels = await listUserTelegramChannels(
+          result.apiId,
+          result.apiHash,
+          result.sessionString
+        );
+      } catch {
+        // Non-fatal
+      }
+
+      res.json({
+        signedIn: true,
+        config: getPublicConfig(updated),
+        channels,
+      });
+    } catch (err) {
+      res.status(400).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : "Failed to import Telegram session string",
+      });
+    }
+  });
+
+  app.get("/api/telegram/user/export-session", (_req, res) => {
+    const store = readStore();
+    if (
+      !store.config.sessionString ||
+      !store.config.apiId ||
+      !store.config.apiHash
+    ) {
+      return res.status(400).json({
+        error: "Telegram account is not signed in yet.",
+      });
+    }
+    res.json({
+      apiId: store.config.apiId,
+      apiHash: store.config.apiHash,
+      sessionString: store.config.sessionString,
+      channelId: store.config.channelId || "",
+    });
   });
 
   app.get("/api/telegram/user/channels", async (_req, res) => {

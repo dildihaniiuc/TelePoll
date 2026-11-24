@@ -184,6 +184,12 @@ function formatMtprotoError(err: unknown): string {
   if (msg.includes("PHONE_CODE_EXPIRED")) {
     return "ভেরিফিকেশন কোডের মেয়াদ শেষ হয়েছে। অনুগ্রহ করে নতুন কোড পাঠান।";
   }
+  if (msg.includes("SEND_CODE_UNAVAILABLE")) {
+    return "টেলিগ্রাম এই নম্বরের জন্য SMS কোড রিসেন্ড বন্ধ রেখেছে। কোডটি আপনার ফোনের Telegram অ্যাপের অফিসিয়াল 'Telegram' চ্যাটে (777000) পাঠানো হয়েছে—অথবা QR / অ্যাপ লিংক দিয়ে কোড ছাড়াই লগইন করুন।";
+  }
+  if (msg.includes("AUTH_TOKEN_EXPIRED")) {
+    return "QR কোডের মেয়াদ শেষ হয়েছে। অনুগ্রহ করে নতুন QR তৈরি করুন।";
+  }
   if (msg.includes("API_ID_INVALID") || msg.includes("API_ID_PUBLISHED_FLOOD")) {
     return "my.telegram.org থেকে নেওয়া API ID বা API Hash সঠিক নয়।";
   }
@@ -305,7 +311,7 @@ export async function sendTelegramAuthCode(params: {
   apiId: number;
   apiHash: string;
   phoneNumber: string;
-}): Promise<{ authId: string; isCodeViaApp: boolean }> {
+}): Promise<{ authId: string; isCodeViaApp: boolean; canResendSms: boolean }> {
   const apiId = Number(params.apiId);
   const apiHash = params.apiHash.trim();
   const phoneNumber = normalizePhoneNumber(params.phoneNumber);
@@ -338,11 +344,26 @@ export async function sendTelegramAuthCode(params: {
 
     try {
       await withTimeout(client.connect(), 9_000, "CONNECT_TIMEOUT");
-      const { phoneCodeHash, isCodeViaApp } = await withTimeout(
-        client.sendCode({ apiId, apiHash }, phoneNumber),
+      const sendRes = await withTimeout(
+        client.invoke(
+          new Api.auth.SendCode({
+            phoneNumber,
+            apiId,
+            apiHash,
+            settings: new Api.CodeSettings({}),
+          })
+        ),
         12_000,
         "CONNECT_TIMEOUT"
       );
+
+      if (sendRes instanceof Api.auth.SentCodeSuccess) {
+        throw new Error("অ্যাকাউন্টটি ইতিমধ্যেই লগইন অবস্থায় আছে।");
+      }
+
+      const phoneCodeHash = sendRes.phoneCodeHash;
+      const isCodeViaApp = sendRes.type instanceof Api.auth.SentCodeTypeApp;
+      const canResendSms = Boolean(sendRes.nextType);
       const sessionString = client.session.save() as unknown as string;
       await client.disconnect().catch(() => {});
 
@@ -356,7 +377,7 @@ export async function sendTelegramAuthCode(params: {
       };
       const authId = encryptPendingAuthToken(payload);
       pendingAuths.set(authId, payload);
-      return { authId, isCodeViaApp };
+      return { authId, isCodeViaApp, canResendSms };
     } catch (err) {
       await client.disconnect().catch(() => {});
       lastErr = err;
@@ -379,7 +400,7 @@ export async function sendTelegramAuthCode(params: {
 
 export async function resendTelegramAuthCode(
   rawAuthId: string
-): Promise<{ authId: string; isCodeViaApp: boolean }> {
+): Promise<{ authId: string; isCodeViaApp: boolean; canResendSms: boolean }> {
   const pending =
     decryptPendingAuthToken(rawAuthId) || pendingAuths.get(rawAuthId);
   if (!pending) {
@@ -422,6 +443,7 @@ export async function resendTelegramAuthCode(
 
     const nextHash = res.phoneCodeHash || pending.phoneCodeHash;
     const isCodeViaApp = res.type instanceof Api.auth.SentCodeTypeApp;
+    const canResendSms = Boolean(res.nextType);
     const updatedSession = client.session.save() as unknown as string;
     await client.disconnect().catch(() => {});
 
@@ -433,7 +455,7 @@ export async function resendTelegramAuthCode(
     };
     const nextAuthId = encryptPendingAuthToken(nextPayload);
     pendingAuths.set(nextAuthId, nextPayload);
-    return { authId: nextAuthId, isCodeViaApp };
+    return { authId: nextAuthId, isCodeViaApp, canResendSms };
   } catch (err) {
     await client.disconnect().catch(() => {});
     throw new Error(formatMtprotoError(err));
@@ -594,6 +616,392 @@ export async function verifyTelegramAuthCode(params: {
     await client.disconnect().catch(() => {});
     throw new Error(formatMtprotoError(err));
   }
+}
+
+interface QrAuthPayload {
+  apiId: number;
+  apiHash: string;
+  sessionString: string;
+  createdAt: number;
+}
+
+function encryptQrToken(payload: QrAuthPayload): string {
+  const key = getStatelessAuthKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const plaintext = Buffer.from(JSON.stringify(payload), "utf8");
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return [
+    "qr1",
+    iv.toString("base64url"),
+    tag.toString("base64url"),
+    encrypted.toString("base64url"),
+  ].join(".");
+}
+
+function decryptQrToken(token: string): QrAuthPayload | null {
+  if (!token || !token.startsWith("qr1.")) return null;
+  const parts = token.split(".");
+  if (parts.length !== 4) return null;
+  try {
+    const iv = Buffer.from(parts[1], "base64url");
+    const tag = Buffer.from(parts[2], "base64url");
+    const encrypted = Buffer.from(parts[3], "base64url");
+    const key = getStatelessAuthKey();
+    const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([
+      decipher.update(encrypted),
+      decipher.final(),
+    ]);
+    const parsed = JSON.parse(decrypted.toString("utf8")) as QrAuthPayload;
+    if (!parsed?.apiId || !parsed?.apiHash || !parsed?.sessionString) {
+      return null;
+    }
+    if (Date.now() - parsed.createdAt > 10 * 60_000) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function startTelegramQrLogin(params: {
+  apiId: number;
+  apiHash: string;
+}): Promise<{ qrAuthId: string; loginUrl: string; expires: number }> {
+  const apiId = Number(params.apiId);
+  const apiHash = params.apiHash.trim();
+
+  if (!apiId || Number.isNaN(apiId)) {
+    throw new Error("সঠিক Telegram API ID দিন (my.telegram.org থেকে প্রাপ্ত)।");
+  }
+  if (!apiHash || apiHash.length < 16) {
+    throw new Error("সঠিক Telegram API Hash দিন (my.telegram.org থেকে প্রাপ্ত)।");
+  }
+
+  let lastErr: unknown;
+  for (const useWSS of [true, false]) {
+    const client = new TelegramClient(new StringSession(""), apiId, apiHash, {
+      connectionRetries: 2,
+      retryDelay: 400,
+      timeout: 7,
+      requestRetries: 2,
+      autoReconnect: false,
+      useWSS,
+      baseLogger: createQuietLogger(),
+    });
+
+    try {
+      await withTimeout(client.connect(), 9_000, "CONNECT_TIMEOUT");
+      const res = await withTimeout(
+        client.invoke(
+          new Api.auth.ExportLoginToken({
+            apiId,
+            apiHash,
+            exceptIds: [],
+          })
+        ),
+        10_000,
+        "CONNECT_TIMEOUT"
+      );
+
+      if (!(res instanceof Api.auth.LoginToken)) {
+        throw new Error("টেলিগ্রাম থেকে QR লগইন টোকেন পাওয়া যায়নি।");
+      }
+
+      const loginUrl = `tg://login?token=${Buffer.from(res.token).toString("base64url")}`;
+      const sessionString = client.session.save() as unknown as string;
+      await client.disconnect().catch(() => {});
+
+      const qrAuthId = encryptQrToken({
+        apiId,
+        apiHash,
+        sessionString,
+        createdAt: Date.now(),
+      });
+
+      return {
+        qrAuthId,
+        loginUrl,
+        expires: res.expires,
+      };
+    } catch (err) {
+      await client.disconnect().catch(() => {});
+      lastErr = err;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isTransportFailure =
+        errMsg.includes("CONNECT_TIMEOUT") ||
+        errMsg.includes("ETIMEDOUT") ||
+        errMsg.includes("ECONNREFUSED") ||
+        errMsg.includes("ECONNRESET") ||
+        errMsg.includes("Not connected");
+      if (!isTransportFailure) {
+        throw new Error(formatMtprotoError(err));
+      }
+    }
+  }
+
+  throw new Error(formatMtprotoError(lastErr));
+}
+
+export async function checkTelegramQrLogin(params: {
+  qrAuthId: string;
+  password?: string;
+}): Promise<
+  | { status: "pending"; qrAuthId: string; loginUrl: string; expires: number }
+  | { status: "requires_2fa"; qrAuthId: string }
+  | {
+      status: "signed_in";
+      apiId: number;
+      apiHash: string;
+      sessionString: string;
+      user: {
+        id: string;
+        displayName: string;
+        username?: string;
+        phone: string;
+      };
+    }
+> {
+  const payload = decryptQrToken(params.qrAuthId);
+  if (!payload) {
+    throw new Error("QR সেশনের মেয়াদ শেষ হয়েছে। অনুগ্রহ করে নতুন QR তৈরি করুন।");
+  }
+
+  const client = new TelegramClient(
+    new StringSession(payload.sessionString),
+    payload.apiId,
+    payload.apiHash,
+    {
+      connectionRetries: 2,
+      retryDelay: 400,
+      timeout: 8,
+      requestRetries: 2,
+      autoReconnect: false,
+      useWSS: true,
+      baseLogger: createQuietLogger(),
+    }
+  );
+
+  try {
+    await withTimeout(client.connect(), 10_000, "CONNECT_TIMEOUT");
+
+    let signedInUser: Api.User | undefined;
+
+    if (params.password) {
+      const res = await client.signInWithPassword(
+        { apiId: payload.apiId, apiHash: payload.apiHash },
+        {
+          password: async () => params.password!.trim(),
+          onError: async (err) => {
+            throw err;
+          },
+        }
+      );
+      if (res instanceof Api.User) signedInUser = res;
+    } else {
+      try {
+        const res = await withTimeout(
+          client.invoke(
+            new Api.auth.ExportLoginToken({
+              apiId: payload.apiId,
+              apiHash: payload.apiHash,
+              exceptIds: [],
+            })
+          ),
+          10_000,
+          "CONNECT_TIMEOUT"
+        );
+
+        if (res instanceof Api.auth.LoginToken) {
+          const loginUrl = `tg://login?token=${Buffer.from(res.token).toString("base64url")}`;
+          const updatedSession = client.session.save() as unknown as string;
+          await client.disconnect().catch(() => {});
+          return {
+            status: "pending",
+            qrAuthId: encryptQrToken({
+              ...payload,
+              sessionString: updatedSession || payload.sessionString,
+              createdAt: Date.now(),
+            }),
+            loginUrl,
+            expires: res.expires,
+          };
+        }
+
+        if (res instanceof Api.auth.LoginTokenMigrateTo) {
+          await client._switchDC(res.dcId);
+          const migrated = await client.invoke(
+            new Api.auth.ImportLoginToken({ token: res.token })
+          );
+          if (
+            migrated instanceof Api.auth.LoginTokenSuccess &&
+            migrated.authorization instanceof Api.auth.Authorization &&
+            migrated.authorization.user instanceof Api.User
+          ) {
+            signedInUser = migrated.authorization.user;
+          }
+        } else if (
+          res instanceof Api.auth.LoginTokenSuccess &&
+          res.authorization instanceof Api.auth.Authorization &&
+          res.authorization.user instanceof Api.User
+        ) {
+          signedInUser = res.authorization.user;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("SESSION_PASSWORD_NEEDED")) {
+          const updatedSession = client.session.save() as unknown as string;
+          await client.disconnect().catch(() => {});
+          return {
+            status: "requires_2fa",
+            qrAuthId: encryptQrToken({
+              ...payload,
+              sessionString: updatedSession || payload.sessionString,
+              createdAt: Date.now(),
+            }),
+          };
+        }
+        throw err;
+      }
+    }
+
+    if (!signedInUser) {
+      const me = await client.getMe();
+      if (me instanceof Api.User) signedInUser = me;
+    }
+
+    const sessionString = client.session.save() as unknown as string;
+    if (IS_VERCEL) {
+      await client.disconnect().catch(() => {});
+    } else {
+      const cacheKey = `${payload.apiId}:${sessionString.slice(0, 24)}`;
+      activeClients.set(cacheKey, client);
+    }
+
+    const fullName = [signedInUser?.firstName, signedInUser?.lastName]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+
+    return {
+      status: "signed_in",
+      apiId: payload.apiId,
+      apiHash: payload.apiHash,
+      sessionString,
+      user: {
+        id: signedInUser ? String(signedInUser.id) : "",
+        displayName: fullName || signedInUser?.username || "Telegram User",
+        username: signedInUser?.username || undefined,
+        phone: signedInUser?.phone ? `+${signedInUser.phone}` : "",
+      },
+    };
+  } catch (err) {
+    await client.disconnect().catch(() => {});
+    throw new Error(formatMtprotoError(err));
+  }
+}
+
+export async function importTelegramSession(params: {
+  apiId: number;
+  apiHash: string;
+  sessionString: string;
+}): Promise<{
+  apiId: number;
+  apiHash: string;
+  sessionString: string;
+  user: {
+    id: string;
+    displayName: string;
+    username?: string;
+    phone: string;
+  };
+}> {
+  const apiId = Number(params.apiId);
+  const apiHash = params.apiHash.trim();
+  const sessionString = params.sessionString.trim();
+
+  if (!apiId || Number.isNaN(apiId)) {
+    throw new Error("সঠিক Telegram API ID দিন।");
+  }
+  if (!apiHash || apiHash.length < 16) {
+    throw new Error("সঠিক Telegram API Hash দিন।");
+  }
+  if (!sessionString || sessionString.length < 40) {
+    throw new Error("বৈধ GramJS Session String দিন।");
+  }
+
+  let lastErr: unknown;
+  for (const useWSS of [true, false]) {
+    const client = new TelegramClient(
+      new StringSession(sessionString),
+      apiId,
+      apiHash,
+      {
+        connectionRetries: 2,
+        retryDelay: 400,
+        timeout: 8,
+        requestRetries: 2,
+        autoReconnect: false,
+        useWSS,
+        baseLogger: createQuietLogger(),
+      }
+    );
+
+    try {
+      await withTimeout(client.connect(), 10_000, "CONNECT_TIMEOUT");
+      const authorized = await client.isUserAuthorized();
+      if (!authorized) {
+        throw new Error("এই Session String-টির অনুমোদন মেয়াদ শেষ বা সঠিক নয়।");
+      }
+      const me = await client.getMe();
+      const user = me instanceof Api.User ? me : undefined;
+      const savedSession =
+        (client.session.save() as unknown as string) || sessionString;
+
+      if (IS_VERCEL) {
+        await client.disconnect().catch(() => {});
+      } else {
+        const cacheKey = `${apiId}:${savedSession.slice(0, 24)}`;
+        activeClients.set(cacheKey, client);
+      }
+
+      const fullName = [user?.firstName, user?.lastName]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+
+      return {
+        apiId,
+        apiHash,
+        sessionString: savedSession,
+        user: {
+          id: user ? String(user.id) : "",
+          displayName: fullName || user?.username || "Telegram User",
+          username: user?.username || undefined,
+          phone: user?.phone ? `+${user.phone}` : "",
+        },
+      };
+    } catch (err) {
+      await client.disconnect().catch(() => {});
+      lastErr = err;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isTransportFailure =
+        errMsg.includes("CONNECT_TIMEOUT") ||
+        errMsg.includes("ETIMEDOUT") ||
+        errMsg.includes("ECONNREFUSED") ||
+        errMsg.includes("ECONNRESET") ||
+        errMsg.includes("Not connected");
+      if (!isTransportFailure) {
+        throw new Error(formatMtprotoError(err));
+      }
+    }
+  }
+
+  throw new Error(formatMtprotoError(lastErr));
 }
 
 function evaluateEntityAdminStatus(entity: unknown): {

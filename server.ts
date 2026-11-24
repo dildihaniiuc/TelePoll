@@ -1,5 +1,6 @@
 import express from "express";
 import dotenv from "dotenv";
+import http from "http";
 import path from "path";
 import {
   createExpressApp,
@@ -23,13 +24,25 @@ const IS_VERCEL = Boolean(process.env.VERCEL || process.env.NOW_REGION);
 
 export { createExpressApp };
 
-export async function createApp(): Promise<express.Express> {
+export async function createApp(
+  httpServer?: http.Server
+): Promise<express.Express> {
   const app = createExpressApp();
 
   if (process.env.NODE_ENV !== "production" && !IS_VERCEL) {
     const { createServer: createViteServer } = await import("vite");
+    const hmrDisabled = process.env.DISABLE_HMR === "true";
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        ...(httpServer
+          ? {
+              ws: { server: httpServer },
+              hmr: hmrDisabled ? false : { server: httpServer },
+            }
+          : {}),
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -54,9 +67,11 @@ export function getApp(): Promise<express.Express> {
 }
 
 async function startServer() {
-  const app = await getApp();
+  const httpServer = http.createServer();
+  const app = await createApp(httpServer);
+  httpServer.on("request", app);
 
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`TelePoll Agent server running on http://0.0.0.0:${PORT}`);
     void syncAgentListeners().catch((err) => {
       console.warn("Could not start saved Telegram listener on boot:", err);

@@ -1,13 +1,19 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import QRCode from "qrcode";
 import {
   Bot,
+  Check,
   CheckCircle2,
+  Copy,
   ExternalLink,
+  KeyRound,
   Loader2,
   LogOut,
   MessageSquare,
+  QrCode,
   RefreshCw,
   ShieldCheck,
+  Smartphone,
   Trash2,
 } from "lucide-react";
 import { COPY } from "../i18n";
@@ -40,11 +46,13 @@ export function ChannelSettings({
   );
 
   // Direct Telegram Account MTProto states
+  const [loginMethod, setLoginMethod] = useState<"qr" | "otp" | "session">("qr");
   const [apiId, setApiId] = useState(config?.apiId ? String(config.apiId) : "");
   const [apiHash, setApiHash] = useState("");
   const [phoneNumber, setPhoneNumber] = useState(config?.userPhone ?? "");
   const [authId, setAuthId] = useState<string | null>(null);
   const [codeViaApp, setCodeViaApp] = useState<boolean>(true);
+  const [canResendSms, setCanResendSms] = useState<boolean>(false);
   const [otpCode, setOtpCode] = useState("");
   const [requires2FA, setRequires2FA] = useState(false);
   const [twoFaPassword, setTwoFaPassword] = useState("");
@@ -52,6 +60,29 @@ export function ChannelSettings({
   const [isResendingCode, setIsResendingCode] = useState(false);
   const [isVerifyingLogin, setIsVerifyingLogin] = useState(false);
   const [directError, setDirectError] = useState<string | null>(null);
+
+  // QR / 1-Tap App Login states
+  const [qrAuthId, setQrAuthId] = useState<string | null>(null);
+  const [qrLoginUrl, setQrLoginUrl] = useState<string | null>(null);
+  const [qrImageDataUrl, setQrImageDataUrl] = useState<string | null>(null);
+  const [qrRequires2FA, setQrRequires2FA] = useState(false);
+  const [qrPassword, setQrPassword] = useState("");
+  const [isStartingQr, setIsStartingQr] = useState(false);
+  const [isCheckingQr, setIsCheckingQr] = useState(false);
+  const qrPollBusyRef = useRef(false);
+
+  // Session Import & Export states
+  const [importSessionString, setImportSessionString] = useState("");
+  const [isImportingSession, setIsImportingSession] = useState(false);
+  const [showExportPanel, setShowExportPanel] = useState(false);
+  const [isLoadingExport, setIsLoadingExport] = useState(false);
+  const [exportedCredentials, setExportedCredentials] = useState<{
+    apiId: number;
+    apiHash: string;
+    sessionString: string;
+    channelId: string;
+  } | null>(null);
+  const [copiedField, setCopiedField] = useState<"session" | "env" | null>(null);
 
   // User's Telegram channels list
   const [channels, setChannels] = useState<TelegramDialogSummary[]>([]);
@@ -102,12 +133,26 @@ export function ChannelSettings({
     }
   }, [config]);
 
+  const safeReadJson = async (res: Response): Promise<Record<string, any>> => {
+    const raw = await res.text();
+    try {
+      return raw ? (JSON.parse(raw) as Record<string, any>) : {};
+    } catch {
+      const compact = raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      throw new Error(
+        compact
+          ? `Server error (${res.status}): ${compact.slice(0, 140)}`
+          : `Server returned HTTP ${res.status}`
+      );
+    }
+  };
+
   const fetchUserChannels = async () => {
     setLoadingChannels(true);
     setDirectError(null);
     try {
       const res = await fetch("/api/telegram/user/channels");
-      const data = await res.json();
+      const data = await safeReadJson(res);
       if (!res.ok) throw new Error(data.error || "Failed to load channels");
       setChannels(data.channels || []);
     } catch (err) {
@@ -126,25 +171,33 @@ export function ChannelSettings({
     }
   }, [config?.hasUserSession]);
 
-  const safeReadJson = async (res: Response): Promise<Record<string, any>> => {
-    const raw = await res.text();
-    try {
-      return raw ? (JSON.parse(raw) as Record<string, any>) : {};
-    } catch {
-      const compact = raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-      throw new Error(
-        compact
-          ? `Server error (${res.status}): ${compact.slice(0, 140)}`
-          : `Server returned HTTP ${res.status}`
-      );
+  useEffect(() => {
+    if (!qrLoginUrl) {
+      setQrImageDataUrl(null);
+      return;
     }
-  };
+    let cancelled = false;
+    QRCode.toDataURL(qrLoginUrl, {
+      width: 220,
+      margin: 2,
+      color: { dark: "#06110D", light: "#F8FAFC" },
+    })
+      .then((url) => {
+        if (!cancelled) setQrImageDataUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setQrImageDataUrl(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [qrLoginUrl]);
 
-  const handleSendCode = async () => {
+  const handleSendCode = async (overridePhone?: string) => {
     setDirectError(null);
     const cleanApiId = apiId.trim();
     const cleanApiHash = apiHash.trim();
-    const cleanPhone = phoneNumber.trim();
+    const cleanPhone = (overridePhone ?? phoneNumber).trim();
 
     if (!cleanApiId) {
       const msg =
@@ -189,6 +242,7 @@ export function ChannelSettings({
       if (!res.ok) throw new Error(data.error || "Failed to send login code");
       setAuthId(data.authId);
       setCodeViaApp(Boolean(data.isCodeViaApp));
+      setCanResendSms(Boolean(data.canResendSms));
       setRequires2FA(false);
       setOtpCode("");
       setTwoFaPassword("");
@@ -197,8 +251,8 @@ export function ChannelSettings({
         "success",
         data.isCodeViaApp
           ? lang === "bn"
-            ? "আপনার টেলিগ্রাম অ্যাপে (Telegram চ্যাট) কোড পাঠানো হয়েছে!"
-            : "Verification code sent to your Telegram app chat!"
+            ? "আপনার টেলিগ্রাম অ্যাপের Telegram (777000) চ্যাটে কোড পাঠানো হয়েছে!"
+            : "Verification code sent to your Telegram app chat (777000)!"
           : lang === "bn"
             ? "আপনার ফোনে SMS/কল-এর মাধ্যমে ভেরিফিকেশন কোড পাঠানো হয়েছে।"
             : "Verification code sent via SMS/call."
@@ -226,6 +280,7 @@ export function ChannelSettings({
       if (!res.ok) throw new Error(data.error || "Failed to resend code");
       if (data.authId) setAuthId(data.authId);
       setCodeViaApp(Boolean(data.isCodeViaApp));
+      setCanResendSms(Boolean(data.canResendSms));
       onNotify(
         "success",
         data.isCodeViaApp
@@ -296,6 +351,257 @@ export function ChannelSettings({
     }
   };
 
+  const handleStartQrLogin = async () => {
+    setDirectError(null);
+    const cleanApiId = apiId.trim();
+    const cleanApiHash = apiHash.trim();
+
+    if (!cleanApiId) {
+      const msg =
+        lang === "bn"
+          ? "my.telegram.org থেকে পাওয়া API ID দিন।"
+          : "Please enter your Telegram API ID from my.telegram.org.";
+      setDirectError(msg);
+      onNotify("error", msg);
+      return;
+    }
+    if (!cleanApiHash && !config?.hasApiCredentials) {
+      const msg =
+        lang === "bn"
+          ? "my.telegram.org থেকে পাওয়া API Hash দিন।"
+          : "Please enter your Telegram API Hash from my.telegram.org.";
+      setDirectError(msg);
+      onNotify("error", msg);
+      return;
+    }
+
+    setIsStartingQr(true);
+    try {
+      const res = await fetch("/api/telegram/user/qr-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiId: cleanApiId,
+          apiHash: cleanApiHash || undefined,
+        }),
+      });
+      const data = await safeReadJson(res);
+      if (!res.ok) throw new Error(data.error || "Failed to generate QR login");
+      setQrAuthId(data.qrAuthId);
+      setQrLoginUrl(data.loginUrl);
+      setQrRequires2FA(false);
+      setQrPassword("");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to create QR code";
+      setDirectError(msg);
+      onNotify("error", msg);
+    } finally {
+      setIsStartingQr(false);
+    }
+  };
+
+  const handleCheckQrLogin = useCallback(
+    async (explicitPassword?: string) => {
+      if (!qrAuthId || qrPollBusyRef.current) return;
+      qrPollBusyRef.current = true;
+      setIsCheckingQr(true);
+      try {
+        const res = await fetch("/api/telegram/user/qr-check", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            qrAuthId,
+            password: explicitPassword?.trim() || undefined,
+          }),
+        });
+        const data = await safeReadJson(res);
+        if (!res.ok) throw new Error(data.error || "QR verification failed");
+
+        if (data.status === "pending") {
+          if (data.qrAuthId) setQrAuthId(data.qrAuthId);
+          if (data.loginUrl) setQrLoginUrl(data.loginUrl);
+          return;
+        }
+
+        if (data.status === "requires_2fa") {
+          if (data.qrAuthId) setQrAuthId(data.qrAuthId);
+          setQrRequires2FA(true);
+          setDirectError(null);
+          return;
+        }
+
+        if (data.status === "signed_in") {
+          setQrAuthId(null);
+          setQrLoginUrl(null);
+          setQrImageDataUrl(null);
+          setQrRequires2FA(false);
+          setQrPassword("");
+          setDirectError(null);
+          onConfigUpdated(data.config);
+          void syncSessionVault();
+          if (Array.isArray(data.channels)) {
+            setChannels(data.channels);
+          } else {
+            void fetchUserChannels();
+          }
+          onNotify(
+            "success",
+            lang === "bn"
+              ? "টেলিগ্রাম অ্যাপ অনুমোদনের মাধ্যমে সফলভাবে লগইন হয়েছে!"
+              : "Telegram account signed in via app approval!"
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "QR check failed";
+        setDirectError(msg);
+        if (explicitPassword) {
+          onNotify("error", msg);
+        } else if (msg.includes("মেয়াদ শেষ") || msg.includes("expired")) {
+          setQrAuthId(null);
+          setQrLoginUrl(null);
+        }
+      } finally {
+        qrPollBusyRef.current = false;
+        setIsCheckingQr(false);
+      }
+    },
+    [qrAuthId, lang, onConfigUpdated, onNotify]
+  );
+
+  useEffect(() => {
+    if (
+      mode !== "user" ||
+      config?.hasUserSession ||
+      loginMethod !== "qr" ||
+      !qrAuthId ||
+      qrRequires2FA
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void handleCheckQrLogin();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [mode, config?.hasUserSession, loginMethod, qrAuthId, qrRequires2FA, handleCheckQrLogin]);
+
+  const handleImportSession = async () => {
+    setDirectError(null);
+    const cleanApiId = apiId.trim();
+    const cleanApiHash = apiHash.trim();
+    const cleanSession = importSessionString.trim();
+
+    if (!cleanApiId) {
+      const msg =
+        lang === "bn"
+          ? "my.telegram.org থেকে পাওয়া API ID দিন।"
+          : "Please enter your Telegram API ID.";
+      setDirectError(msg);
+      return;
+    }
+    if (!cleanApiHash && !config?.hasApiCredentials) {
+      const msg =
+        lang === "bn"
+          ? "my.telegram.org থেকে পাওয়া API Hash দিন।"
+          : "Please enter your Telegram API Hash.";
+      setDirectError(msg);
+      return;
+    }
+    if (!cleanSession || cleanSession.length < 40) {
+      const msg =
+        lang === "bn"
+          ? "সঠিক GramJS Session String পেস্ট করুন।"
+          : "Please paste a valid GramJS Session String.";
+      setDirectError(msg);
+      return;
+    }
+
+    setIsImportingSession(true);
+    try {
+      const res = await fetch("/api/telegram/user/import-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiId: cleanApiId,
+          apiHash: cleanApiHash || undefined,
+          sessionString: cleanSession,
+        }),
+      });
+      const data = await safeReadJson(res);
+      if (!res.ok) throw new Error(data.error || "Failed to import session");
+
+      setImportSessionString("");
+      onConfigUpdated(data.config);
+      void syncSessionVault();
+      if (Array.isArray(data.channels)) {
+        setChannels(data.channels);
+      } else {
+        void fetchUserChannels();
+      }
+      onNotify(
+        "success",
+        lang === "bn"
+          ? "Session String থেকে টেলিগ্রাম অ্যাকাউন্ট কানেক্ট হয়েছে!"
+          : "Telegram account connected from Session String!"
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Session import failed";
+      setDirectError(msg);
+      onNotify("error", msg);
+    } finally {
+      setIsImportingSession(false);
+    }
+  };
+
+  const handleToggleExportPanel = async () => {
+    if (showExportPanel) {
+      setShowExportPanel(false);
+      return;
+    }
+    setShowExportPanel(true);
+    setIsLoadingExport(true);
+    try {
+      const res = await fetch("/api/telegram/user/export-session");
+      const data = await safeReadJson(res);
+      if (!res.ok) throw new Error(data.error || "Failed to export session");
+      setExportedCredentials({
+        apiId: Number(data.apiId),
+        apiHash: String(data.apiHash || ""),
+        sessionString: String(data.sessionString || ""),
+        channelId: String(data.channelId || ""),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Could not export session";
+      onNotify("error", msg);
+      setShowExportPanel(false);
+    } finally {
+      setIsLoadingExport(false);
+    }
+  };
+
+  const handleCopyExport = async (kind: "session" | "env") => {
+    if (!exportedCredentials) return;
+    const text =
+      kind === "session"
+        ? exportedCredentials.sessionString
+        : [
+            `TELEGRAM_API_ID=${exportedCredentials.apiId}`,
+            `TELEGRAM_API_HASH=${exportedCredentials.apiHash}`,
+            `TELEGRAM_SESSION_STRING=${exportedCredentials.sessionString}`,
+            exportedCredentials.channelId
+              ? `TELEGRAM_CHANNEL_ID=${exportedCredentials.channelId}`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedField(kind);
+      window.setTimeout(() => setCopiedField(null), 2400);
+    } catch {
+      onNotify("error", "Clipboard permission blocked.");
+    }
+  };
+
   const handleSelectChannel = async (
     channelId: string,
     channelTitle: string,
@@ -308,7 +614,7 @@ export function ChannelSettings({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ channelId, channelTitle, channelType }),
       });
-      const data = await res.json();
+      const data = await safeReadJson(res);
       if (!res.ok) throw new Error(data.error || "Failed to set channel");
       onConfigUpdated(data.config);
       void syncSessionVault();
@@ -336,11 +642,13 @@ export function ChannelSettings({
       const res = await fetch("/api/telegram/user/session", {
         method: "DELETE",
       });
-      const data = await res.json();
+      const data = await safeReadJson(res);
       await clearSessionVault("user");
-      onConfigUpdated(data);
+      onConfigUpdated(data as PublicTelegramConfig);
       setChannels([]);
       setAuthId(null);
+      setExportedCredentials(null);
+      setShowExportPanel(false);
       onNotify(
         "success",
         lang === "bn"
@@ -364,12 +672,12 @@ export function ChannelSettings({
           channelId: botChannelId.trim(),
         }),
       });
-      const data = await res.json();
+      const data = await safeReadJson(res);
       if (!res.ok || !data.verified) {
         throw new Error(data.error || "Telegram verification failed");
       }
       setBotToken("");
-      onConfigUpdated(data.config);
+      onConfigUpdated(data.config as PublicTelegramConfig);
       void syncSessionVault();
       onNotify(
         "success",
@@ -396,9 +704,9 @@ export function ChannelSettings({
     setConfirmClearToken(false);
     try {
       const res = await fetch("/api/telegram/token", { method: "DELETE" });
-      const data = await res.json();
+      const data = await safeReadJson(res);
       await clearSessionVault("bot");
-      onConfigUpdated(data);
+      onConfigUpdated(data as PublicTelegramConfig);
       onNotify(
         "success",
         lang === "bn"
@@ -429,9 +737,9 @@ export function ChannelSettings({
           agentTriggerMode: overrideTrigger ?? triggerMode,
         }),
       });
-      const data = await res.json();
+      const data = await safeReadJson(res);
       if (!res.ok) throw new Error(data.error || "Failed to update group agent");
-      onConfigUpdated(data.config);
+      onConfigUpdated(data.config as PublicTelegramConfig);
       void syncSessionVault();
       onNotify(
         "success",
@@ -464,9 +772,9 @@ export function ChannelSettings({
           defaultLanguage: defaultLang,
         }),
       });
-      const data = await res.json();
+      const data = await safeReadJson(res);
       if (!res.ok) throw new Error(data.error || "Save failed");
-      onConfigUpdated(data);
+      onConfigUpdated(data as PublicTelegramConfig);
       void syncSessionVault();
       onNotify(
         "success",
@@ -576,7 +884,21 @@ export function ChannelSettings({
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleToggleExportPanel}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-sm border transition-colors cursor-pointer ${
+                      showExportPanel
+                        ? "text-emerald-300 bg-emerald-500/15 border-emerald-500/40"
+                        : "text-cyan-300 bg-[#0A141E] border-cyan-500/35 hover:border-cyan-400/60"
+                    }`}
+                  >
+                    <KeyRound className="w-3.5 h-3.5" />
+                    {lang === "bn"
+                      ? "Session / Vercel Env কপি"
+                      : "Copy Session / Env"}
+                  </button>
                   <button
                     type="button"
                     onClick={fetchUserChannels}
@@ -608,6 +930,71 @@ export function ChannelSettings({
                   </button>
                 </div>
               </div>
+
+              {showExportPanel && (
+                <div className="p-4 rounded-sm border border-cyan-500/30 bg-[#050C12] space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs font-semibold text-cyan-200">
+                      {lang === "bn"
+                        ? "স্থায়ী কানেকশনের জন্য Session বা Vercel Env ভেরিয়েবল কপি করুন"
+                        : "Copy Session String or Vercel Environment Variables"}
+                    </div>
+                    {exportedCredentials && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleCopyExport("session")}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-mono text-slate-200 bg-[#0D1720] border border-slate-700 rounded-sm hover:border-emerald-500/40 cursor-pointer"
+                        >
+                          {copiedField === "session" ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5 text-cyan-400" />
+                          )}
+                          {copiedField === "session"
+                            ? lang === "bn"
+                              ? "কপি হয়েছে!"
+                              : "Copied!"
+                            : lang === "bn"
+                              ? "Session String কপি"
+                              : "Copy Session"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleCopyExport("env")}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-mono font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 cursor-pointer"
+                        >
+                          {copiedField === "env" ? (
+                            <Check className="w-3.5 h-3.5" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                          {copiedField === "env"
+                            ? lang === "bn"
+                              ? "Env কপি হয়েছে!"
+                              : "Copied Env!"
+                            : lang === "bn"
+                              ? "Vercel Env কপি করুন"
+                              : "Copy Vercel Env"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {isLoadingExport ? (
+                    <div className="py-2 flex items-center gap-2 text-xs font-mono text-slate-400">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+                      {lang === "bn" ? "লোড হচ্ছে..." : "Loading credentials..."}
+                    </div>
+                  ) : exportedCredentials ? (
+                    <p className="text-[11px] text-slate-400 leading-relaxed">
+                      {lang === "bn"
+                        ? "উপরের 'Vercel Env কপি করুন' চেপে Vercel Project Settings > Environment Variables-এ পেস্ট করলে ডিপ্লয়মেন্ট রিস্টার্ট হলেও সব সময় কানেক্টেড থাকবে। অথবা যেকোনো ব্রাউজারে 'Session Import' ট্যাবে শুধু Session String দিয়ে লগইন করতে পারবেন। (এটি গোপন রাখুন)"
+                        : "Paste the copied block into Vercel Environment Variables so cold starts always stay connected, or paste the Session String into the Session Import tab on any browser. Keep these credentials private."}
+                    </p>
+                  ) : null}
+                </div>
+              )}
 
               <div className="space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -749,129 +1136,481 @@ export function ChannelSettings({
               )}
             </div>
           ) : (
-            /* Direct Phone + OTP + 2FA Sign-In Form */
-            <div className="hacker-panel rounded-sm p-5 space-y-4">
-              {!authId ? (
-                <>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div>
-                      <div className="flex items-center justify-between mb-1.5">
-                        <label className="text-xs font-medium text-slate-300">
-                          {t.apiIdLabel}
-                        </label>
-                        <a
-                          href="https://my.telegram.org/apps"
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-1 text-xs font-mono font-medium text-cyan-400 hover:underline"
-                        >
-                          my.telegram.org
-                          <ExternalLink className="w-3 h-3" />
-                        </a>
-                      </div>
-                      <input
-                        type="text"
-                        inputMode="numeric"
-                        value={apiId}
-                        onChange={(e) => setApiId(e.target.value)}
-                        placeholder="e.g. 24198765"
-                        className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
-                      />
-                    </div>
+            /* Direct Telegram Login: QR / 1-Tap App, Phone+OTP, or Session Import */
+            <div className="hacker-panel rounded-sm p-5 space-y-5">
+              {/* Login Method Sub-Tabs */}
+              <div className="flex flex-wrap items-center gap-1.5 p-1 bg-[#06090D] border border-slate-800 rounded-sm">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLoginMethod("qr");
+                    setDirectError(null);
+                  }}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-sm border transition-colors cursor-pointer ${
+                    loginMethod === "qr"
+                      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40"
+                      : "border-transparent text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <QrCode className="w-3.5 h-3.5" />
+                  {lang === "bn"
+                    ? "QR / ১-ট্যাপ অ্যাপ (কোড ছাড়াই)"
+                    : "QR / 1-Tap App (No Code)"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLoginMethod("otp");
+                    setDirectError(null);
+                  }}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-sm border transition-colors cursor-pointer ${
+                    loginMethod === "otp"
+                      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40"
+                      : "border-transparent text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <Smartphone className="w-3.5 h-3.5" />
+                  {lang === "bn" ? "ফোন ও কোড (OTP)" : "Phone & Code"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLoginMethod("session");
+                    setDirectError(null);
+                  }}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-sm border transition-colors cursor-pointer ${
+                    loginMethod === "session"
+                      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40"
+                      : "border-transparent text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <KeyRound className="w-3.5 h-3.5" />
+                  {lang === "bn" ? "Session ইমপোর্ট" : "Import Session"}
+                </button>
+              </div>
 
-                    <div>
-                      <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                        {t.apiHashLabel}
-                      </label>
-                      <input
-                        type="password"
-                        value={apiHash}
-                        onChange={(e) => setApiHash(e.target.value)}
-                        placeholder={
-                          config?.hasApiCredentials
-                            ? "Saved (leave blank to reuse)"
-                            : "32-character API hash"
-                        }
-                        className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
-                      />
-                    </div>
-                  </div>
-
+              {/* Shared API ID + API Hash Fields (hidden only mid-OTP verification) */}
+              {!(loginMethod === "otp" && authId) && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                      {t.phoneLabel}
-                    </label>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-medium text-slate-300">
+                        {t.apiIdLabel}
+                      </label>
+                      <a
+                        href="https://my.telegram.org/apps"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-xs font-mono font-medium text-cyan-400 hover:underline"
+                      >
+                        my.telegram.org
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    </div>
                     <input
-                      type="tel"
-                      value={phoneNumber}
-                      onChange={(e) => setPhoneNumber(e.target.value)}
-                      placeholder={t.phonePlaceholder}
+                      type="text"
+                      inputMode="numeric"
+                      value={apiId}
+                      onChange={(e) => setApiId(e.target.value)}
+                      placeholder="e.g. 24198765"
                       className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
                     />
                   </div>
 
-                  {directError && (
-                    <div className="px-3.5 py-2.5 text-xs text-rose-200 bg-rose-950/40 border border-rose-500/35 rounded-sm">
-                      {directError}
-                    </div>
-                  )}
-
-                  <div className="flex justify-end pt-1">
-                    <button
-                      type="button"
-                      onClick={handleSendCode}
-                      disabled={isSendingCode}
-                      className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)] disabled:opacity-60 transition-colors cursor-pointer"
-                    >
-                      {isSendingCode && (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      )}
-                      {isSendingCode ? t.sendingCodeBtn : t.sendCodeBtn}
-                    </button>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                      {t.apiHashLabel}
+                    </label>
+                    <input
+                      type="password"
+                      value={apiHash}
+                      onChange={(e) => setApiHash(e.target.value)}
+                      placeholder={
+                        config?.hasApiCredentials
+                          ? "Saved (leave blank to reuse)"
+                          : "32-character API hash"
+                      }
+                      className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
+                    />
                   </div>
-                </>
-              ) : (
-                <>
-                  {!requires2FA ? (
-                    <div className="space-y-3">
-                      <div className="px-3.5 py-2.5 text-xs text-emerald-200 bg-emerald-950/35 border border-emerald-500/35 rounded-sm leading-relaxed">
-                        {codeViaApp
-                          ? lang === "bn"
-                            ? "কোডটি আপনার টেলিগ্রাম অ্যাপের ভেতরে অফিসিয়াল 'Telegram' চ্যাটে (777000) পাঠানো হয়েছে (মোবাইল SMS-এ নয়)।"
-                            : "Code sent inside your Telegram app in the official 'Telegram' service chat (not SMS)."
-                          : lang === "bn"
-                            ? "কোডটি আপনার ফোন নম্বরে SMS/কল-এর মাধ্যমে পাঠানো হয়েছে।"
-                            : "Code sent to your phone number via SMS/call."}
+                </div>
+              )}
+
+              {loginMethod === "qr" ? (
+                <div className="space-y-4">
+                  {!qrAuthId ? (
+                    <>
+                      <div className="px-3.5 py-2.5 text-xs text-cyan-200 bg-cyan-950/30 border border-cyan-500/30 rounded-sm leading-relaxed">
+                        {lang === "bn"
+                          ? "কোনো SMS বা ৭৭৭০০০ কোড ছাড়াই লগইন করুন! মোবাইল থেকে এক ক্লিকে Telegram অ্যাপে অনুমোদন করুন, অথবা অন্য ফোন দিয়ে QR স্ক্যান করুন।"
+                          : "Sign in without waiting for SMS or 777000 codes! Tap once on mobile to approve inside your Telegram app, or scan the QR from another device."}
+                      </div>
+
+                      {directError && (
+                        <div className="px-3.5 py-2.5 text-xs text-rose-200 bg-rose-950/40 border border-rose-500/35 rounded-sm">
+                          {directError}
+                        </div>
+                      )}
+
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={handleStartQrLogin}
+                          disabled={isStartingQr}
+                          className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)] disabled:opacity-60 transition-colors cursor-pointer"
+                        >
+                          {isStartingQr ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <QrCode className="w-4 h-4" />
+                          )}
+                          {isStartingQr
+                            ? lang === "bn"
+                              ? "QR তৈরি হচ্ছে..."
+                              : "Generating QR..."
+                            : lang === "bn"
+                              ? "QR কোড ও অ্যাপ লিংক তৈরি করুন"
+                              : "Generate QR & 1-Tap App Link"}
+                        </button>
+                      </div>
+                    </>
+                  ) : qrRequires2FA ? (
+                    <div className="space-y-4">
+                      <div className="px-3.5 py-2.5 text-xs text-emerald-200 bg-emerald-950/35 border border-emerald-500/35 rounded-sm">
+                        {lang === "bn"
+                          ? "অ্যাপ থেকে অনুমোদন সম্পন্ন হয়েছে! আপনার অ্যাকাউন্টে 2FA পাসওয়ার্ড চালু থাকায় নিচে পাসওয়ার্ড দিন।"
+                          : "App approval succeeded! Enter your Telegram 2FA cloud password to finish signing in."}
                       </div>
 
                       <div>
                         <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                          {t.otpLabel}
+                          {t.twoFaLabel}
                         </label>
                         <input
-                          type="text"
-                          inputMode="numeric"
-                          value={otpCode}
-                          onChange={(e) => setOtpCode(e.target.value)}
-                          placeholder={t.otpPlaceholder}
-                          className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
+                          type="password"
+                          value={qrPassword}
+                          onChange={(e) => setQrPassword(e.target.value)}
+                          placeholder={t.twoFaPlaceholder}
+                          className="w-full px-3.5 py-2 text-sm bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400"
                         />
+                      </div>
+
+                      {directError && (
+                        <div className="px-3.5 py-2.5 text-xs text-rose-200 bg-rose-950/40 border border-rose-500/35 rounded-sm">
+                          {directError}
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setQrAuthId(null);
+                            setQrLoginUrl(null);
+                            setQrRequires2FA(false);
+                            setDirectError(null);
+                          }}
+                          className="text-xs font-medium text-slate-400 hover:text-slate-100 cursor-pointer"
+                        >
+                          {lang === "bn" ? "বাতিল ও নতুন QR নিন" : "Start New QR"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleCheckQrLogin(qrPassword)}
+                          disabled={isCheckingQr || !qrPassword.trim()}
+                          className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 disabled:opacity-60 cursor-pointer"
+                        >
+                          {isCheckingQr && (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          )}
+                          {t.verifyLoginBtn}
+                        </button>
                       </div>
                     </div>
                   ) : (
-                    <div>
-                      <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                        {t.twoFaLabel}
-                      </label>
-                      <input
-                        type="password"
-                        value={twoFaPassword}
-                        onChange={(e) => setTwoFaPassword(e.target.value)}
-                        placeholder={t.twoFaPlaceholder}
-                        className="w-full px-3.5 py-2 text-sm bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
-                      />
+                    <div className="space-y-4">
+                      <div className="flex flex-col sm:flex-row items-center gap-5 p-4 rounded-sm bg-[#050C12] border border-emerald-500/25">
+                        {qrImageDataUrl ? (
+                          <div className="p-2 bg-white rounded-sm shrink-0">
+                            <img
+                              src={qrImageDataUrl}
+                              alt="Telegram QR Login"
+                              className="w-44 h-44 block"
+                            />
+                          </div>
+                        ) : (
+                          <div className="w-48 h-48 flex items-center justify-center bg-slate-900 rounded-sm shrink-0">
+                            <Loader2 className="w-6 h-6 animate-spin text-emerald-400" />
+                          </div>
+                        )}
+
+                        <div className="space-y-3 flex-1 min-w-0">
+                          <div className="text-xs text-slate-200 leading-relaxed">
+                            {lang === "bn" ? (
+                              <>
+                                <strong className="text-emerald-300">মোবাইল থেকে:</strong> নিচের বাটনে ট্যাপ করে Telegram অ্যাপে অনুমোদন দিন। অথবা অন্য ডিভাইস থেকে{" "}
+                                <span className="font-mono text-cyan-300">
+                                  Telegram &gt; Settings &gt; Devices &gt; Link Desktop Device
+                                </span>{" "}
+                                দিয়ে QR স্ক্যান করুন।
+                              </>
+                            ) : (
+                              <>
+                                <strong className="text-emerald-300">On Mobile:</strong> Tap the button below to approve inside Telegram. Or scan with{" "}
+                                <span className="font-mono text-cyan-300">
+                                  Telegram &gt; Settings &gt; Devices &gt; Link Desktop Device
+                                </span>
+                                .
+                              </>
+                            )}
+                          </div>
+
+                          {qrLoginUrl &&
+                            qrLoginUrl.startsWith("tg://login?token=") && (
+                              <a
+                                href={qrLoginUrl}
+                                className="inline-flex items-center justify-center gap-2 w-full sm:w-auto px-4 py-2.5 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)] transition-colors"
+                              >
+                                <ExternalLink className="w-4 h-4" />
+                                {lang === "bn"
+                                  ? "Telegram অ্যাপে খুলে অনুমোদন করুন (১-ট্যাপ)"
+                                  : "Open in Telegram App to Approve (1-Tap)"}
+                              </a>
+                            )}
+
+                          <div className="flex items-center gap-2 text-xs font-mono text-cyan-300">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                            <span>
+                              {lang === "bn"
+                                ? "অ্যাপ থেকে অনুমোদনের জন্য স্বয়ংক্রিয়ভাবে অপেক্ষা করা হচ্ছে..."
+                                : "Waiting automatically for app approval..."}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {directError && (
+                        <div className="px-3.5 py-2.5 text-xs text-rose-200 bg-rose-950/40 border border-rose-500/35 rounded-sm">
+                          {directError}
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <button
+                          type="button"
+                          onClick={handleStartQrLogin}
+                          disabled={isStartingQr}
+                          className="inline-flex items-center gap-1.5 text-xs font-medium text-cyan-300 hover:text-cyan-200 cursor-pointer"
+                        >
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 ${
+                              isStartingQr ? "animate-spin" : ""
+                            }`}
+                          />
+                          {lang === "bn" ? "নতুন QR তৈরি করুন" : "Refresh QR"}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleCheckQrLogin()}
+                          disabled={isCheckingQr}
+                          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-slate-200 bg-[#111923] border border-slate-700 rounded-sm hover:border-emerald-500/40 cursor-pointer"
+                        >
+                          {isCheckingQr && (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          )}
+                          {lang === "bn"
+                            ? "আমি অনুমোদন করেছি — যাচাই করুন"
+                            : "I Approved — Check Now"}
+                        </button>
+                      </div>
                     </div>
                   )}
+                </div>
+              ) : loginMethod === "otp" ? (
+                !authId ? (
+                  <>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                        {t.phoneLabel}
+                      </label>
+                      <input
+                        type="tel"
+                        value={phoneNumber}
+                        onChange={(e) => setPhoneNumber(e.target.value)}
+                        placeholder={t.phonePlaceholder}
+                        className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
+                      />
+                    </div>
+
+                    {directError && (
+                      <div className="px-3.5 py-2.5 text-xs text-rose-200 bg-rose-950/40 border border-rose-500/35 rounded-sm">
+                        {directError}
+                      </div>
+                    )}
+
+                    <div className="flex justify-end pt-1">
+                      <button
+                        type="button"
+                        onClick={() => handleSendCode()}
+                        disabled={isSendingCode}
+                        className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)] disabled:opacity-60 transition-colors cursor-pointer"
+                      >
+                        {isSendingCode && (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        )}
+                        {isSendingCode ? t.sendingCodeBtn : t.sendCodeBtn}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {!requires2FA ? (
+                      <div className="space-y-3">
+                        <div className="px-3.5 py-2.5 text-xs text-emerald-200 bg-emerald-950/35 border border-emerald-500/35 rounded-sm leading-relaxed">
+                          {codeViaApp
+                            ? lang === "bn"
+                              ? "কোডটি আপনার টেলিগ্রাম অ্যাপের ভেতরে অফিসিয়াল 'Telegram' চ্যাটে (777000) পাঠানো হয়েছে (মোবাইল SMS-এ নয়)। আপনার ফোনের Telegram অ্যাপটি খুলে 777000 চ্যাট চেক করুন।"
+                              : "Code sent inside your Telegram app in the official 'Telegram' service chat (777000), not via SMS."
+                            : lang === "bn"
+                              ? "কোডটি আপনার ফোন নম্বরে SMS/কল-এর মাধ্যমে পাঠানো হয়েছে।"
+                              : "Code sent to your phone number via SMS/call."}
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                            {t.otpLabel}
+                          </label>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={otpCode}
+                            onChange={(e) => setOtpCode(e.target.value)}
+                            placeholder={t.otpPlaceholder}
+                            className="w-full px-3.5 py-2 text-sm font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <div>
+                        <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                          {t.twoFaLabel}
+                        </label>
+                        <input
+                          type="password"
+                          value={twoFaPassword}
+                          onChange={(e) => setTwoFaPassword(e.target.value)}
+                          placeholder={t.twoFaPlaceholder}
+                          className="w-full px-3.5 py-2 text-sm bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400 focus:shadow-[0_0_10px_rgba(16,185,129,0.2)]"
+                        />
+                      </div>
+                    )}
+
+                    {directError && (
+                      <div className="px-3.5 py-2.5 text-xs text-rose-200 bg-rose-950/40 border border-rose-500/35 rounded-sm">
+                        {directError}
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                      <div className="flex flex-wrap items-center gap-4">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAuthId(null);
+                            setRequires2FA(false);
+                            setDirectError(null);
+                          }}
+                          className="text-xs font-medium text-slate-400 hover:text-slate-100 cursor-pointer"
+                        >
+                          {t.restartLoginBtn}
+                        </button>
+
+                        {!requires2FA && canResendSms && (
+                          <button
+                            type="button"
+                            onClick={handleResendCode}
+                            disabled={isResendingCode}
+                            className="inline-flex items-center gap-1.5 text-xs font-medium text-cyan-300 hover:text-cyan-200 disabled:opacity-60 cursor-pointer"
+                          >
+                            {isResendingCode && (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            )}
+                            {lang === "bn"
+                              ? "আবার কোড পাঠান (SMS)"
+                              : "Resend Code (SMS)"}
+                          </button>
+                        )}
+
+                        {!requires2FA && !canResendSms && (
+                          <button
+                            type="button"
+                            onClick={() => handleSendCode()}
+                            disabled={isSendingCode}
+                            className="inline-flex items-center gap-1.5 text-xs font-medium text-cyan-300 hover:text-cyan-200 disabled:opacity-60 cursor-pointer"
+                          >
+                            {isSendingCode && (
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                            )}
+                            {lang === "bn"
+                              ? "অ্যাপে নতুন কোড রিফ্রেশ করুন"
+                              : "Request Fresh App Code"}
+                          </button>
+                        )}
+
+                        {!requires2FA && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAuthId(null);
+                              setDirectError(null);
+                              setLoginMethod("qr");
+                            }}
+                            className="text-xs font-medium text-emerald-300 hover:underline cursor-pointer"
+                          >
+                            {lang === "bn"
+                              ? "কোড ছাড়াই QR / ১-ট্যাপ লগইন"
+                              : "Try QR / 1-Tap Instead"}
+                          </button>
+                        )}
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleVerifyLogin}
+                        disabled={isVerifyingLogin}
+                        className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)] disabled:opacity-60 transition-colors cursor-pointer"
+                      >
+                        {isVerifyingLogin && (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        )}
+                        {isVerifyingLogin ? t.verifyingLoginBtn : t.verifyLoginBtn}
+                      </button>
+                    </div>
+                  </>
+                )
+              ) : (
+                /* Session String Import Tab */
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                      {lang === "bn"
+                        ? "GramJS Session String পেস্ট করুন"
+                        : "Paste GramJS Session String"}
+                    </label>
+                    <textarea
+                      rows={3}
+                      value={importSessionString}
+                      onChange={(e) => setImportSessionString(e.target.value)}
+                      placeholder="1BVtsOMwBu..."
+                      className="w-full px-3.5 py-2 text-xs font-mono bg-[#04080C] text-slate-100 placeholder:text-slate-500 border border-emerald-500/25 rounded-sm focus:outline-none focus:ring-1 focus:ring-emerald-400/40 focus:border-emerald-400"
+                    />
+                    <p className="mt-1.5 text-[11px] text-slate-400">
+                      {lang === "bn"
+                        ? "আগে কানেক্ট করা ডিভাইস থেকে 'Session / Vercel Env কপি' করে এখানে পেস্ট করলে কোনো OTP ছাড়াই সাথে সাথে কানেক্ট হবে।"
+                        : "Paste a Session String exported from another connected device to sign in instantly without OTP."}
+                    </p>
+                  </div>
 
                   {directError && (
                     <div className="px-3.5 py-2.5 text-xs text-rose-200 bg-rose-950/40 border border-rose-500/35 rounded-sm">
@@ -879,50 +1618,26 @@ export function ChannelSettings({
                     </div>
                   )}
 
-                  <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
-                    <div className="flex items-center gap-4">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAuthId(null);
-                          setRequires2FA(false);
-                          setDirectError(null);
-                        }}
-                        className="text-xs font-medium text-slate-400 hover:text-slate-100 cursor-pointer"
-                      >
-                        {t.restartLoginBtn}
-                      </button>
-
-                      {!requires2FA && (
-                        <button
-                          type="button"
-                          onClick={handleResendCode}
-                          disabled={isResendingCode}
-                          className="inline-flex items-center gap-1.5 text-xs font-medium text-cyan-300 hover:text-cyan-200 disabled:opacity-60 cursor-pointer"
-                        >
-                          {isResendingCode && (
-                            <Loader2 className="w-3 h-3 animate-spin" />
-                          )}
-                          {lang === "bn"
-                            ? "আবার কোড পাঠান (SMS)"
-                            : "Resend Code (SMS)"}
-                        </button>
-                      )}
-                    </div>
-
+                  <div className="flex justify-end">
                     <button
                       type="button"
-                      onClick={handleVerifyLogin}
-                      disabled={isVerifyingLogin}
+                      onClick={handleImportSession}
+                      disabled={isImportingSession}
                       className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)] disabled:opacity-60 transition-colors cursor-pointer"
                     >
-                      {isVerifyingLogin && (
+                      {isImportingSession && (
                         <Loader2 className="w-4 h-4 animate-spin" />
                       )}
-                      {isVerifyingLogin ? t.verifyingLoginBtn : t.verifyLoginBtn}
+                      {isImportingSession
+                        ? lang === "bn"
+                          ? "যাচাই ও কানেক্ট হচ্ছে..."
+                          : "Importing & Connecting..."
+                        : lang === "bn"
+                          ? "Session ইমপোর্ট ও কানেক্ট করুন"
+                          : "Import & Connect Session"}
                     </button>
                   </div>
-                </>
+                </div>
               )}
             </div>
           )}

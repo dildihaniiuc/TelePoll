@@ -43,6 +43,12 @@ function applyEnvDefaults(config: TelegramConfig): TelegramConfig {
   if (!next.controlGroupId && envControlGroupId) {
     next.controlGroupId = envControlGroupId;
   }
+  if (next.sessionString && !next.userDisplayName) {
+    next.userDisplayName = process.env.TELEGRAM_USER_NAME?.trim() || "Telegram Account";
+  }
+  if (next.sessionString && next.channelId && !next.verifiedAt) {
+    next.verifiedAt = new Date().toISOString();
+  }
   if (!next.sessionString && next.botToken && !process.env.TELEGRAM_SESSION_STRING) {
     next.authMode = "bot";
   }
