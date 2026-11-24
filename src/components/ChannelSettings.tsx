@@ -33,6 +33,57 @@ interface ChannelSettingsProps {
   onNotify: (type: "success" | "error", message: string) => void;
 }
 
+const PENDING_OTP_STORAGE_KEY = "telepoll_pending_otp_v1";
+const PENDING_QR_STORAGE_KEY = "telepoll_pending_qr_v1";
+
+interface StoredPendingOtp {
+  authId: string;
+  apiId: string;
+  phoneNumber: string;
+  codeViaApp: boolean;
+  canResendSms: boolean;
+  requires2FA: boolean;
+  savedAt: number;
+}
+
+interface StoredPendingQr {
+  qrAuthId: string;
+  qrLoginUrl: string;
+  qrRequires2FA: boolean;
+  apiId: string;
+  savedAt: number;
+}
+
+function loadStoredPendingOtp(): StoredPendingOtp | null {
+  try {
+    const raw = localStorage.getItem(PENDING_OTP_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredPendingOtp;
+    if (!parsed?.authId || Date.now() - Number(parsed.savedAt || 0) > 14 * 60_000) {
+      localStorage.removeItem(PENDING_OTP_STORAGE_KEY);
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function loadStoredPendingQr(): StoredPendingQr | null {
+  try {
+    const raw = localStorage.getItem(PENDING_QR_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredPendingQr;
+    if (!parsed?.qrAuthId || Date.now() - Number(parsed.savedAt || 0) > 9 * 60_000) {
+      localStorage.removeItem(PENDING_QR_STORAGE_KEY);
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export function ChannelSettings({
   lang,
   config,
@@ -41,20 +92,43 @@ export function ChannelSettings({
 }: ChannelSettingsProps) {
   const t = COPY[lang];
 
+  const initialPendingOtp = useRef<StoredPendingOtp | null>(
+    typeof window !== "undefined" ? loadStoredPendingOtp() : null
+  );
+  const initialPendingQr = useRef<StoredPendingQr | null>(
+    typeof window !== "undefined" ? loadStoredPendingQr() : null
+  );
+
   const [mode, setMode] = useState<TelegramAuthMode>(
     config?.authMode ?? "user"
   );
 
-  // Direct Telegram Account MTProto states
-  const [loginMethod, setLoginMethod] = useState<"qr" | "otp" | "session">("qr");
-  const [apiId, setApiId] = useState(config?.apiId ? String(config.apiId) : "");
+  // Direct Telegram Account MTProto states (default "otp" for smooth single-phone login via Telegram 777000)
+  const [loginMethod, setLoginMethod] = useState<"qr" | "otp" | "session">(() =>
+    !initialPendingOtp.current && initialPendingQr.current ? "qr" : "otp"
+  );
+  const [apiId, setApiId] = useState(
+    initialPendingOtp.current?.apiId ||
+      initialPendingQr.current?.apiId ||
+      (config?.apiId ? String(config.apiId) : "")
+  );
   const [apiHash, setApiHash] = useState("");
-  const [phoneNumber, setPhoneNumber] = useState(config?.userPhone ?? "");
-  const [authId, setAuthId] = useState<string | null>(null);
-  const [codeViaApp, setCodeViaApp] = useState<boolean>(true);
-  const [canResendSms, setCanResendSms] = useState<boolean>(false);
+  const [phoneNumber, setPhoneNumber] = useState(
+    initialPendingOtp.current?.phoneNumber || config?.userPhone || ""
+  );
+  const [authId, setAuthId] = useState<string | null>(
+    initialPendingOtp.current?.authId ?? null
+  );
+  const [codeViaApp, setCodeViaApp] = useState<boolean>(
+    initialPendingOtp.current?.codeViaApp ?? true
+  );
+  const [canResendSms, setCanResendSms] = useState<boolean>(
+    initialPendingOtp.current?.canResendSms ?? false
+  );
   const [otpCode, setOtpCode] = useState("");
-  const [requires2FA, setRequires2FA] = useState(false);
+  const [requires2FA, setRequires2FA] = useState(
+    initialPendingOtp.current?.requires2FA ?? false
+  );
   const [twoFaPassword, setTwoFaPassword] = useState("");
   const [isSendingCode, setIsSendingCode] = useState(false);
   const [isResendingCode, setIsResendingCode] = useState(false);
@@ -62,10 +136,16 @@ export function ChannelSettings({
   const [directError, setDirectError] = useState<string | null>(null);
 
   // QR / 1-Tap App Login states
-  const [qrAuthId, setQrAuthId] = useState<string | null>(null);
-  const [qrLoginUrl, setQrLoginUrl] = useState<string | null>(null);
+  const [qrAuthId, setQrAuthId] = useState<string | null>(
+    initialPendingQr.current?.qrAuthId ?? null
+  );
+  const [qrLoginUrl, setQrLoginUrl] = useState<string | null>(
+    initialPendingQr.current?.qrLoginUrl ?? null
+  );
   const [qrImageDataUrl, setQrImageDataUrl] = useState<string | null>(null);
-  const [qrRequires2FA, setQrRequires2FA] = useState(false);
+  const [qrRequires2FA, setQrRequires2FA] = useState(
+    initialPendingQr.current?.qrRequires2FA ?? false
+  );
   const [qrPassword, setQrPassword] = useState("");
   const [isStartingQr, setIsStartingQr] = useState(false);
   const [isCheckingQr, setIsCheckingQr] = useState(false);
@@ -82,7 +162,7 @@ export function ChannelSettings({
     sessionString: string;
     channelId: string;
   } | null>(null);
-  const [copiedField, setCopiedField] = useState<"session" | "env" | null>(null);
+  const [copiedField, setCopiedField] = useState<"session" | "env" | "qrlink" | null>(null);
 
   // User's Telegram channels list
   const [channels, setChannels] = useState<TelegramDialogSummary[]>([]);
@@ -122,7 +202,7 @@ export function ChannelSettings({
   useEffect(() => {
     if (config) {
       setMode(config.authMode || "user");
-      if (config.apiId) setApiId(String(config.apiId));
+      if (config.apiId && !apiId) setApiId(String(config.apiId));
       setManualChannelInput(config.channelId || "");
       setBotChannelId(config.channelId || "");
       setPersona(config.agentPersona || "");
@@ -130,8 +210,56 @@ export function ChannelSettings({
       setControlGroupId(config.controlGroupId || "");
       setControlGroupTitle(config.controlGroupTitle || "");
       setTriggerMode(config.agentTriggerMode || "all");
+      if (config.hasUserSession) {
+        try {
+          localStorage.removeItem(PENDING_OTP_STORAGE_KEY);
+          localStorage.removeItem(PENDING_QR_STORAGE_KEY);
+        } catch {
+          // Ignore storage errors
+        }
+      }
     }
   }, [config]);
+
+  useEffect(() => {
+    try {
+      if (authId) {
+        const snapshot: StoredPendingOtp = {
+          authId,
+          apiId,
+          phoneNumber,
+          codeViaApp,
+          canResendSms,
+          requires2FA,
+          savedAt: Date.now(),
+        };
+        localStorage.setItem(PENDING_OTP_STORAGE_KEY, JSON.stringify(snapshot));
+      } else {
+        localStorage.removeItem(PENDING_OTP_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }, [authId, apiId, phoneNumber, codeViaApp, canResendSms, requires2FA]);
+
+  useEffect(() => {
+    try {
+      if (qrAuthId && qrLoginUrl) {
+        const snapshot: StoredPendingQr = {
+          qrAuthId,
+          qrLoginUrl,
+          qrRequires2FA,
+          apiId,
+          savedAt: Date.now(),
+        };
+        localStorage.setItem(PENDING_QR_STORAGE_KEY, JSON.stringify(snapshot));
+      } else {
+        localStorage.removeItem(PENDING_QR_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }, [qrAuthId, qrLoginUrl, qrRequires2FA, apiId]);
 
   const safeReadJson = async (res: Response): Promise<Record<string, any>> => {
     const raw = await res.text();
@@ -1138,8 +1266,23 @@ export function ChannelSettings({
           ) : (
             /* Direct Telegram Login: QR / 1-Tap App, Phone+OTP, or Session Import */
             <div className="hacker-panel rounded-sm p-5 space-y-5">
-              {/* Login Method Sub-Tabs */}
+              {/* Login Method Sub-Tabs (Default: Phone + Telegram 777000 Code for 1 Phone) */}
               <div className="flex flex-wrap items-center gap-1.5 p-1 bg-[#06090D] border border-slate-800 rounded-sm">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLoginMethod("otp");
+                    setDirectError(null);
+                  }}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-sm border transition-colors cursor-pointer ${
+                    loginMethod === "otp"
+                      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40"
+                      : "border-transparent text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <Smartphone className="w-3.5 h-3.5" />
+                  {lang === "bn" ? "ফোন ও কোড (১ ফোনেই)" : "Phone & Code (1-Phone)"}
+                </button>
                 <button
                   type="button"
                   onClick={() => {
@@ -1154,23 +1297,8 @@ export function ChannelSettings({
                 >
                   <QrCode className="w-3.5 h-3.5" />
                   {lang === "bn"
-                    ? "QR / ১-ট্যাপ অ্যাপ (কোড ছাড়াই)"
-                    : "QR / 1-Tap App (No Code)"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setLoginMethod("otp");
-                    setDirectError(null);
-                  }}
-                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-sm border transition-colors cursor-pointer ${
-                    loginMethod === "otp"
-                      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40"
-                      : "border-transparent text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  <Smartphone className="w-3.5 h-3.5" />
-                  {lang === "bn" ? "ফোন ও কোড (OTP)" : "Phone & Code"}
+                    ? "১-ট্যাপ অ্যাপ / QR"
+                    : "1-Tap App / QR"}
                 </button>
                 <button
                   type="button"
@@ -1329,63 +1457,112 @@ export function ChannelSettings({
                     </div>
                   ) : (
                     <div className="space-y-4">
-                      <div className="flex flex-col sm:flex-row items-center gap-5 p-4 rounded-sm bg-[#050C12] border border-emerald-500/25">
-                        {qrImageDataUrl ? (
-                          <div className="p-2 bg-white rounded-sm shrink-0">
-                            <img
-                              src={qrImageDataUrl}
-                              alt="Telegram QR Login"
-                              className="w-44 h-44 block"
-                            />
-                          </div>
-                        ) : (
-                          <div className="w-48 h-48 flex items-center justify-center bg-slate-900 rounded-sm shrink-0">
-                            <Loader2 className="w-6 h-6 animate-spin text-emerald-400" />
-                          </div>
-                        )}
+                      {/* 1-Phone App Link Section FIRST (No 2nd phone or QR image upload required) */}
+                      <div className="p-4 rounded-sm bg-[#061210] border border-emerald-500/35 space-y-3">
+                        <div className="text-xs text-slate-200 leading-relaxed">
+                          <strong className="text-emerald-300">
+                            {lang === "bn"
+                              ? "একটি ফোনেই লগইন (QR স্ক্যান বা গ্যালারি আপলোড ছাড়াই):"
+                              : "Single-Phone Login (No QR scan or upload needed):"}
+                          </strong>{" "}
+                          {lang === "bn"
+                            ? "টেলিগ্রাম অ্যাপে QR ছবি আপলোডের অপশন থাকে না। তাই ১ ফোনে লগইন করতে নিচের বাটনে চাপুন, অথবা লিংক কপি করে টেলিগ্রামের Saved Messages-এ পাঠিয়ে সেখানে ট্যাপ করুন—অথবা সবচেয়ে সহজে 'ফোন ও কোড (১ ফোনেই)' ট্যাব ব্যবহার করুন।"
+                            : "Telegram's scanner doesn't support uploading QR images. On one phone, tap the button below, or copy the link into your Telegram Saved Messages and tap it—or use the Phone & Code tab."}
+                        </div>
 
-                        <div className="space-y-3 flex-1 min-w-0">
-                          <div className="text-xs text-slate-200 leading-relaxed">
-                            {lang === "bn" ? (
-                              <>
-                                <strong className="text-emerald-300">মোবাইল থেকে:</strong> নিচের বাটনে ট্যাপ করে Telegram অ্যাপে অনুমোদন দিন। অথবা অন্য ডিভাইস থেকে{" "}
-                                <span className="font-mono text-cyan-300">
-                                  Telegram &gt; Settings &gt; Devices &gt; Link Desktop Device
-                                </span>{" "}
-                                দিয়ে QR স্ক্যান করুন।
-                              </>
-                            ) : (
-                              <>
-                                <strong className="text-emerald-300">On Mobile:</strong> Tap the button below to approve inside Telegram. Or scan with{" "}
-                                <span className="font-mono text-cyan-300">
-                                  Telegram &gt; Settings &gt; Devices &gt; Link Desktop Device
-                                </span>
-                                .
-                              </>
-                            )}
-                          </div>
-
-                          {qrLoginUrl &&
-                            qrLoginUrl.startsWith("tg://login?token=") && (
+                        {qrLoginUrl &&
+                          qrLoginUrl.startsWith("tg://login?token=") && (
+                            <div className="flex flex-wrap items-center gap-2.5">
                               <a
                                 href={qrLoginUrl}
-                                className="inline-flex items-center justify-center gap-2 w-full sm:w-auto px-4 py-2.5 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)] transition-colors"
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-950 bg-emerald-400 rounded-sm hover:bg-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.28)] transition-colors"
                               >
                                 <ExternalLink className="w-4 h-4" />
                                 {lang === "bn"
                                   ? "Telegram অ্যাপে খুলে অনুমোদন করুন (১-ট্যাপ)"
                                   : "Open in Telegram App to Approve (1-Tap)"}
                               </a>
-                            )}
 
-                          <div className="flex items-center gap-2 text-xs font-mono text-cyan-300">
-                            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-                            <span>
-                              {lang === "bn"
-                                ? "অ্যাপ থেকে অনুমোদনের জন্য স্বয়ংক্রিয়ভাবে অপেক্ষা করা হচ্ছে..."
-                                : "Waiting automatically for app approval..."}
-                            </span>
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  try {
+                                    await navigator.clipboard.writeText(qrLoginUrl);
+                                    setCopiedField("qrlink");
+                                    window.setTimeout(() => setCopiedField(null), 2400);
+                                  } catch {
+                                    onNotify("error", "Clipboard permission blocked.");
+                                  }
+                                }}
+                                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-mono text-cyan-200 bg-[#0A1620] border border-cyan-500/35 rounded-sm hover:border-cyan-400 cursor-pointer"
+                              >
+                                {copiedField === "qrlink" ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5 text-cyan-400" />
+                                )}
+                                {copiedField === "qrlink"
+                                  ? lang === "bn"
+                                    ? "লিংক কপি হয়েছে!"
+                                    : "Link Copied!"
+                                  : lang === "bn"
+                                    ? "লগইন লিংক কপি করুন (Saved Messages-এর জন্য)"
+                                    : "Copy Login Link"}
+                              </button>
+                            </div>
+                          )}
+
+                        <div className="flex items-center gap-2 text-xs font-mono text-cyan-300">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                          <span>
+                            {lang === "bn"
+                              ? "অ্যাপ থেকে অনুমোদনের জন্য স্বয়ংক্রিয়ভাবে অপেক্ষা করা হচ্ছে..."
+                              : "Waiting automatically for app approval..."}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Optional QR Code only when scanning with a 2nd phone */}
+                      <div className="flex flex-col sm:flex-row items-center gap-4 p-4 rounded-sm bg-[#050C12] border border-slate-800">
+                        {qrImageDataUrl ? (
+                          <div className="p-2 bg-white rounded-sm shrink-0">
+                            <img
+                              src={qrImageDataUrl}
+                              alt="Telegram QR Login"
+                              className="w-36 h-36 block"
+                            />
                           </div>
+                        ) : (
+                          <div className="w-40 h-40 flex items-center justify-center bg-slate-900 rounded-sm shrink-0">
+                            <Loader2 className="w-5 h-5 animate-spin text-emerald-400" />
+                          </div>
+                        )}
+
+                        <div className="text-xs text-slate-400 leading-relaxed">
+                          <div className="font-semibold text-slate-200 mb-1">
+                            {lang === "bn"
+                              ? "অন্য কোনো ২য় ডিভাইস / ল্যাপটপ থেকে স্ক্যান করতে:"
+                              : "If scanning from a 2nd phone or desktop:"}
+                          </div>
+                          {lang === "bn" ? (
+                            <>
+                              আপনার অন্য ডিভাইসের Telegram-এ{" "}
+                              <span className="font-mono text-cyan-300">
+                                Settings &gt; Devices &gt; Link Desktop Device
+                              </span>{" "}
+                              থেকে ক্যামেরা দিয়ে এই QR স্ক্যান করুন।
+                            </>
+                          ) : (
+                            <>
+                              Open{" "}
+                              <span className="font-mono text-cyan-300">
+                                Telegram &gt; Settings &gt; Devices &gt; Link Desktop Device
+                              </span>{" "}
+                              on your other device to scan this QR code.
+                            </>
+                          )}
                         </div>
                       </div>
 
@@ -1467,14 +1644,31 @@ export function ChannelSettings({
                   <>
                     {!requires2FA ? (
                       <div className="space-y-3">
-                        <div className="px-3.5 py-2.5 text-xs text-emerald-200 bg-emerald-950/35 border border-emerald-500/35 rounded-sm leading-relaxed">
-                          {codeViaApp
-                            ? lang === "bn"
-                              ? "কোডটি আপনার টেলিগ্রাম অ্যাপের ভেতরে অফিসিয়াল 'Telegram' চ্যাটে (777000) পাঠানো হয়েছে (মোবাইল SMS-এ নয়)। আপনার ফোনের Telegram অ্যাপটি খুলে 777000 চ্যাট চেক করুন।"
-                              : "Code sent inside your Telegram app in the official 'Telegram' service chat (777000), not via SMS."
-                            : lang === "bn"
-                              ? "কোডটি আপনার ফোন নম্বরে SMS/কল-এর মাধ্যমে পাঠানো হয়েছে।"
-                              : "Code sent to your phone number via SMS/call."}
+                        <div className="px-3.5 py-2.5 text-xs text-emerald-200 bg-emerald-950/35 border border-emerald-500/35 rounded-sm leading-relaxed space-y-2">
+                          <div>
+                            {codeViaApp
+                              ? lang === "bn"
+                                ? "কোডটি আপনার এই ফোনেরই Telegram অ্যাপের অফিসিয়াল 'Telegram' চ্যাটে (777000) পাঠানো হয়েছে (SMS-এ নয়)। আপনার Telegram অ্যাপ খুলে ৫ সংখ্যার কোডটি দেখে নিচে লিখুন—অ্যাপ বদলালেও এই স্ক্রিন হারাবে না।"
+                                : "Code sent inside your Telegram app's official 'Telegram' chat (777000), not via SMS. Open Telegram on this same phone to read the 5-digit code—this screen stays saved."
+                              : lang === "bn"
+                                ? "কোডটি আপনার ফোন নম্বরে SMS/কল-এর মাধ্যমে পাঠানো হয়েছে।"
+                                : "Code sent to your phone number via SMS/call."}
+                          </div>
+                          {codeViaApp && (
+                            <div>
+                              <a
+                                href="tg://resolve?domain=Telegram"
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1.5 text-xs font-semibold text-cyan-300 hover:underline"
+                              >
+                                <ExternalLink className="w-3.5 h-3.5" />
+                                {lang === "bn"
+                                  ? "সরাসরি Telegram অ্যাপ খুলুন (777000 চ্যাট)"
+                                  : "Open Telegram App Directly"}
+                              </a>
+                            </div>
+                          )}
                         </div>
 
                         <div>
